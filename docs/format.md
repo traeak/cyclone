@@ -170,3 +170,66 @@ else:                                     no usable copy (ATS clears the stripe)
 ```
 The chosen copy must then have the magic in header and footer, and a major
 version in 21–24 (`handle_dir_read`).
+
+## Directory
+
+The entries region of the chosen copy is `segments` consecutive segments
+of `buckets × 4` entries (`Directory::get_segment`). Entry `i` of segment
+`s` is at `entries_offset + (s * buckets * 4 + i) * 10`.
+
+### `Dir` entry (10 bytes = 5 × u16)
+
+Bit fields as the `dir_*` macros in `P_CacheDir.h` read them:
+
+| Word | Bits | Field | Meaning |
+|---|---|---|---|
+| w[0] | 0–15 | offset bits 0–15 | |
+| w[1] | 0–7 | offset bits 16–23 | |
+| w[1] | 8–9 | `big` | size unit is `512 << (3 * big)`: 512 B, 4 KB, 32 KB, 256 KB |
+| w[1] | 10–15 | `size` | approximate size = `(size + 1)` units, an upper bound |
+| w[2] | 0–11 | `tag` | `key.slice32(2) & 0xfff` |
+| w[2] | 12 | `phase` | the stripe phase when the fragment was written |
+| w[2] | 13 | `head` | first Doc of an object (the one holding the alternate vector) |
+| w[2] | 14 | `pinned` | |
+| w[3] | 0–15 | `next` | next entry in the chain, as an index in the segment; 0 = end |
+| w[4] | 0–15 | offset bits 24–39 | |
+
+`offset` (40 bits) counts 512-byte blocks from the content start, plus one,
+and 0 means empty. The fragment is at span byte
+`start + (offset - 1) * 512` (`Stripe::vol_offset`).
+
+Free entries reuse w[2] as `prev`, the back link of the segment's doubly
+linked free list, so their tag and flag bits are meaningless.
+
+### Buckets, chains and the free list
+
+- `slice32(i)` is the i-th little-endian u32 of the 16-byte key.
+- A key's segment is `slice32(0) % segments` and its bucket is
+  `slice32(1) % buckets`. Its tag is `slice32(2) & 0xfff`
+  (`Directory::probe`).
+- Row 0 of each bucket (entry `bucket * 4`) is the chain head. An empty head
+  (offset 0) means an empty bucket, and its `next` must be 0
+  (`check_segment`).
+- Rows 1–3 of every bucket form a pool shared by the whole segment.
+  Entries in the pool are either chain links for any bucket or on the free
+  list. The free list starts at the header's `freelist[segment]`; a fresh
+  segment chains all rows 1–3 there (`init_segment`).
+- A probe walks the bucket's chain and compares tags. Every tag match is a
+  candidate, which the Doc's full key must then confirm.
+
+### Validity (`Stripe::dir_valid`)
+
+With `blk = offset - 1` and the header's `phase`, `write_pos` and `agg_pos`:
+
+```
+entry phase == header phase:  valid if blk <  (write_pos - start) / 512    # written this lap
+entry phase != header phase:  valid if blk >= (agg_pos  - start) / 512     # last lap, not yet overwritten
+```
+ATS also counts its in-memory write buffer, which is empty offline. On
+startup, ATS runs recovery (`handle_recover_from_data`) and may drop
+entries near `write_pos` that were written after the last directory sync.
+cyclone reports the directory as it is on disk.
+
+Verified against the fixture: all 49 distinct cache keys have a head entry
+at the bucket and tag their key predicts. In each stripe, the approximate
+entry sizes add up exactly to how far `write_pos` advanced.

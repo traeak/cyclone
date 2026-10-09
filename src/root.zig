@@ -9,9 +9,11 @@ pub const cli = @import("cli.zig");
 pub const url = @import("url.zig");
 pub const span = @import("span.zig");
 pub const stripe = @import("stripe.zig");
+pub const dir = @import("dir.zig");
 pub const format = struct {
     pub const span = @import("format/span.zig");
     pub const stripe = @import("format/stripe.zig");
+    pub const dir = @import("format/dir.zig");
 };
 
 pub const HashType = hash.HashType;
