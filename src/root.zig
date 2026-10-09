@@ -6,6 +6,7 @@
 pub const hash = @import("hash.zig");
 pub const key = @import("key.zig");
 pub const cli = @import("cli.zig");
+pub const url = @import("url.zig");
 
 pub const HashType = hash.HashType;
 pub const CacheKey = key.CacheKey;

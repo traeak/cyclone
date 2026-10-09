@@ -30,11 +30,15 @@ pub const Common = struct {
     /// Span paths in the order ATS was configured with them.
     spans: std.ArrayList([]const u8) = .empty,
 
-    pub const help =
+    pub const hash_help =
         \\  --hash md5|sha256   cache key hash; ATS does not record it on disk (default: md5)
+        \\
+    ;
+    pub const span_help =
         \\  --span PATH         cache span, repeatable, in storage.yaml order
         \\
     ;
+    pub const help = hash_help ++ span_help;
 
     /// Handles `arg` if it is a common option. Returns false otherwise.
     pub fn parse(self: *Common, gpa: std.mem.Allocator, arg: []const u8, it: *ArgIterator) !bool {

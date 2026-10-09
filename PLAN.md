@@ -148,6 +148,6 @@ A daemon (`cyclone-d`) that opens the spans once, keeps stripe headers and direc
 ## Immediate next steps
 
 1. ~~`zig init` skeleton~~ done: module `cyclone` (`src/root.zig`), tools in `src/bin/`, `zig build test`, `zig build cyc-key -- ARGS`.
-2. `cyc-key` first. It is self-contained and can be checked against the `url_cachekey` debug output.
+2. ~~`cyc-key`~~ done: `src/url.zig` ports `url_parse` + `url_CryptoHash_get_general` (and the 9.2 variant). Its output matches keys from ATS master's own code (`tools/ats-keygen`, golden data in `src/testdata/`) for 68 URLs × 4 option sets. SHA-256 output is not yet checked against a FIPS build.
 3. `docs/format.md` + decoders for the span header, stripe header and `Dir`, then `cyc-doc span|stripe|dir` against a fixture.
 4. Lookup (stripe hash table + bucket walk), then HTTPInfo decoding, then whole-object `cyc-doc`.
