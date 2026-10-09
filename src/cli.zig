@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const HashType = @import("hash.zig").HashType;
+const default_avg_obj_size = @import("format/stripe.zig").default_avg_obj_size;
 
 /// Walks argv one option at a time.
 pub const ArgIterator = struct {
@@ -39,6 +40,10 @@ pub const Common = struct {
     hash_type: HashType = .default,
     /// Spans in the order ATS was configured with them.
     spans: std.ArrayList(SpanArg) = .empty,
+    /// `--avg-obj-size N`: proxy.config.cache.min_average_object_size.
+    avg_obj_size: u32 = default_avg_obj_size,
+    /// `--avg-obj-size VOL=N`: storage.yaml per-volume avg_obj_size.
+    volume_avg_obj_size: std.ArrayList(struct { volume: i32, size: u32 }) = .empty,
 
     pub const hash_help =
         \\  --hash md5|sha256   cache key hash; ATS does not record it on disk (default: md5)
@@ -49,6 +54,10 @@ pub const Common = struct {
         \\    --seed TEXT       name ATS hashed for this span: storage.yaml hash_seed, or
         \\                      the configured path if PATH differs (default: PATH)
         \\    --skip BYTES      span header offset (default: probe from 8192)
+        \\  --avg-obj-size [VOL=]N
+        \\                      average object size that sized the stripe directories:
+        \\                      records.yaml min_average_object_size, or a storage.yaml
+        \\                      volume's avg_obj_size with VOL= (default: 8000)
         \\
     ;
     pub const help = hash_help ++ span_help;
@@ -65,10 +74,30 @@ pub const Common = struct {
         } else if (std.mem.eql(u8, arg, "--skip")) {
             const text = it.value(arg);
             self.lastSpan(arg).skip = std.fmt.parseInt(u64, text, 0) catch fatal("bad --skip '{s}'", .{text});
+        } else if (std.mem.eql(u8, arg, "--avg-obj-size")) {
+            const text = it.value(arg);
+            if (std.mem.indexOfScalar(u8, text, '=')) |eq| {
+                const vol = std.fmt.parseInt(i32, text[0..eq], 10) catch fatal("bad volume in --avg-obj-size '{s}'", .{text});
+                try self.volume_avg_obj_size.append(gpa, .{ .volume = vol, .size = parseAvg(text[eq + 1 ..]) });
+            } else {
+                self.avg_obj_size = parseAvg(text);
+            }
         } else {
             return false;
         }
         return true;
+    }
+
+    /// The avg_obj_size that sized stripes of `volume`.
+    pub fn avgObjSize(self: *const Common, volume: i32) u32 {
+        for (self.volume_avg_obj_size.items) |v| if (v.volume == volume) return v.size;
+        return self.avg_obj_size;
+    }
+
+    fn parseAvg(text: []const u8) u32 {
+        const n = std.fmt.parseInt(u32, text, 10) catch fatal("bad --avg-obj-size '{s}'", .{text});
+        if (n == 0) fatal("--avg-obj-size must be positive", .{});
+        return n;
     }
 
     fn lastSpan(self: *Common, flag: []const u8) *SpanArg {
@@ -88,7 +117,7 @@ pub fn isHelp(arg: []const u8) bool {
 }
 
 test ArgIterator {
-    const argv = [_][:0]const u8{ "cyc-key", "--hash", "sha256", "--span", "a.db", "--seed", "/dev/sdb", "--skip", "0x4000", "--span", "b.db" };
+    const argv = [_][:0]const u8{ "cyc-key", "--hash", "sha256", "--span", "a.db", "--seed", "/dev/sdb", "--skip", "0x4000", "--span", "b.db", "--avg-obj-size", "16000", "--avg-obj-size", "2=4096" };
     var it: ArgIterator = .init(&argv);
     var common: Common = .{};
     defer common.spans.deinit(std.testing.allocator);
@@ -100,4 +129,7 @@ test ArgIterator {
     try std.testing.expectEqualStrings("/dev/sdb", common.spans.items[0].seed.?);
     try std.testing.expectEqual(0x4000, common.spans.items[0].skip.?);
     try std.testing.expectEqual(null, common.spans.items[1].seed);
+    try std.testing.expectEqual(16000, common.avgObjSize(1));
+    try std.testing.expectEqual(4096, common.avgObjSize(2));
+    common.volume_avg_obj_size.deinit(std.testing.allocator);
 }

@@ -7,22 +7,25 @@ const cli = cyclone.cli;
 const Span = cyclone.Span;
 
 const usage =
-    \\usage: cyc-doc span --span PATH... [--json]
+    \\usage: cyc-doc span   --span PATH... [--json]
+    \\       cyc-doc stripe --span PATH... [--block SPAN:BLOCK] [--avg-obj-size [VOL=]N] [--json]
     \\
     \\Read cached objects, and inspect the structures that hold them.
     \\
     \\commands:
     \\  span                show span headers and their stripe blocks
-    \\  (object reading, stripe and dir commands: not implemented yet)
+    \\  stripe              show stripe geometry and directory headers
+    \\  (object reading and dir commands: not implemented yet)
     \\
     \\options:
     \\
 ++ cli.Common.help ++
+    \\  --block S:B         only stripe block B of span S (both 0-based, as `span` lists them)
     \\  --json              machine-readable output
     \\
 ;
 
-const Command = enum { span };
+const Command = enum { span, stripe };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -31,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var common: cli.Common = .{};
     var json = false;
     var command: ?Command = null;
+    var only: ?[2]usize = null;
 
     var it: cli.ArgIterator = .init(args);
     while (it.next()) |arg| {
@@ -41,6 +45,13 @@ pub fn main(init: std.process.Init) !void {
             continue;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json = true;
+        } else if (std.mem.eql(u8, arg, "--block")) {
+            const text = it.value(arg);
+            const colon = std.mem.indexOfScalar(u8, text, ':') orelse cli.fatal("--block wants SPAN:BLOCK, got '{s}'", .{text});
+            only = .{
+                std.fmt.parseInt(usize, text[0..colon], 10) catch cli.fatal("bad --block '{s}'", .{text}),
+                std.fmt.parseInt(usize, text[colon + 1 ..], 10) catch cli.fatal("bad --block '{s}'", .{text}),
+            };
         } else if (command == null and !std.mem.startsWith(u8, arg, "-")) {
             command = std.meta.stringToEnum(Command, arg) orelse cli.fatal("unknown command '{s}'\n\n{s}", .{ arg, usage });
         } else {
@@ -54,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (command orelse cli.fatal("no command given\n\n{s}", .{usage})) {
         .span => try spanCommand(init.gpa, init.io, arena, out, common.spans.items, json),
+        .stripe => try stripeCommand(init.gpa, init.io, arena, out, &common, only, json),
     }
     try out.flush();
 }
@@ -166,6 +178,199 @@ fn printSpan(out: *Io.Writer, r: SpanReport) !void {
         try out.writeAll("\n");
         for (r.issues) |issue| try out.print("{s}: {s}\n", .{ @tagName(issue.severity), issue.message });
     }
+}
+
+fn openSpan(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, arg: cli.SpanArg) !Span {
+    return Span.open(gpa, io, arg.path, .{ .seed = arg.seed, .skip = arg.skip }) catch |err| {
+        try out.flush();
+        cli.fatal("{s}: {s}", .{ arg.path, describeOpenError(err) });
+    };
+}
+
+fn stripeCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: *Io.Writer, common: *const cli.Common, only: ?[2]usize, json: bool) !void {
+    const spans = common.spans.items;
+    if (spans.len == 0) cli.fatal("stripe needs at least one --span", .{});
+    if (only) |o| if (o[0] >= spans.len) cli.fatal("--block {d}:{d}: there are only {d} spans", .{ o[0], o[1], spans.len });
+
+    var reports: std.ArrayList(StripeReport) = .empty;
+    for (spans, 0..) |arg, si| {
+        if (only) |o| if (o[0] != si) continue;
+        var span = try openSpan(gpa, io, out, arg);
+        defer span.close(gpa, io);
+        if (only) |o| if (o[1] >= span.blocks.len or span.blocks[o[1]].free)
+            cli.fatal("--block {d}:{d}: no such stripe (see `cyc-doc span`)", .{ o[0], o[1] });
+        for (span.blocks, 0..) |b, bi| {
+            if (b.free) continue;
+            if (only) |o| if (o[1] != bi) continue;
+            var stripe = try cyclone.Stripe.open(gpa, io, &span, bi, common.avgObjSize(b.number));
+            defer stripe.close(gpa);
+            try reports.append(arena, try .init(gpa, io, arena, si, &stripe));
+        }
+    }
+
+    if (json) {
+        try std.json.Stringify.value(reports.items, .{ .whitespace = .indent_2 }, out);
+        try out.writeByte('\n');
+        return;
+    }
+    for (reports.items, 0..) |r, i| {
+        if (i != 0) try out.writeByte('\n');
+        try printStripe(out, r);
+    }
+}
+
+const StripeReport = struct {
+    span_index: usize,
+    block_index: usize,
+    span: []const u8,
+    volume: i32,
+    hash_text: []const u8,
+    offset: u64,
+    len: u64,
+    avg_obj_size: u32,
+    segments: u64,
+    buckets: u64,
+    entries: u64,
+    dir_len: u64,
+    copy_a: u64,
+    copy_b: u64,
+    content_start: u64,
+    content_len: u64,
+    copies: [2]CopyReport,
+    using: ?[]const u8,
+    header: ?cyclone.stripe.HeaderFooter,
+    freelist: []const u16,
+    issues: []const cyclone.span.Issue,
+    diagnosis: ?cyclone.stripe.Diagnosis,
+
+    const CopyReport = struct {
+        header: ?cyclone.stripe.HeaderFooter,
+        footer: ?cyclone.stripe.HeaderFooter,
+    };
+
+    fn init(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, span_index: usize, s: *const cyclone.Stripe) !StripeReport {
+        const g = s.geometry;
+        var hash_text: Io.Writer.Allocating = .init(arena);
+        try s.hashText(&hash_text.writer);
+        const issues = try s.check(arena);
+
+        // Only worth the scan when the footer is missing but header A is there.
+        var diagnosis: ?cyclone.stripe.Diagnosis = null;
+        if (!s.copies[0].magicOk() and !s.copies[1].magicOk()) {
+            if (try cyclone.stripe.diagnoseGeometry(gpa, io, s.span, s.block)) |d| {
+                defer gpa.free(d.candidates);
+                diagnosis = .{ .dir_len = d.dir_len, .candidates = try arena.dupe(cyclone.stripe.Candidate, d.candidates) };
+            }
+        }
+
+        return .{
+            .span_index = span_index,
+            .block_index = s.block_index,
+            .span = s.span.path,
+            .volume = s.block.number,
+            .hash_text = hash_text.written(),
+            .offset = s.block.offset,
+            .len = s.block.byteLen(),
+            .avg_obj_size = s.avg_obj_size,
+            .segments = g.segments,
+            .buckets = g.buckets,
+            .entries = g.entryCount(),
+            .dir_len = g.dirLen(),
+            .copy_a = g.copyOffset(.a),
+            .copy_b = g.copyOffset(.b),
+            .content_start = g.start,
+            .content_len = g.dataLen(),
+            .copies = .{
+                .{ .header = s.copies[0].header, .footer = s.copies[0].footer },
+                .{ .header = s.copies[1].header, .footer = s.copies[1].footer },
+            },
+            .using = if (s.chosen) |c| @tagName(c) else null,
+            .header = s.header(),
+            .freelist = try arena.dupe(u16, s.freelist),
+            .issues = issues,
+            .diagnosis = diagnosis,
+        };
+    }
+};
+
+fn printStripe(out: *Io.Writer, r: StripeReport) !void {
+    const magic = cyclone.format.stripe.stripe_magic;
+    try out.print("stripe      {d}:{d}  volume {d}  in {s}\n", .{ r.span_index, r.block_index, r.volume, r.span });
+    try out.print("hash text   {s}\n", .{r.hash_text});
+    try out.print("location    offset {d}, length {d} ({Bi:.1})\n", .{ r.offset, r.len, r.len });
+    try out.print("geometry    avg_obj_size {d}: {d} segment{s} x {d} buckets x 4 = {d} entries\n", .{
+        r.avg_obj_size, r.segments, if (r.segments == 1) "" else "s", r.buckets, r.entries,
+    });
+    try out.print("directory   {d} bytes per copy; A at {d}, B at {d}\n", .{ r.dir_len, r.copy_a, r.copy_b });
+    try out.print("content     {d} .. {d} ({Bi:.1})\n\n", .{ r.content_start, r.content_start + r.content_len, r.content_len });
+
+    try out.print("  {s: <4}  {s: <10}  {s: <9}  {s: >9}  {s: >9}  {s: >12}  {s}\n", .{ "copy", "magic h/f", "version", "sync h/f", "write ser", "write_pos", "phase/cycle" });
+    for (r.copies, [_][]const u8{ "A", "B" }) |c, name| {
+        const h = c.header orelse {
+            try out.print("  {s: <4}  (past the end of the span)\n", .{name});
+            continue;
+        };
+        var magic_buf: [16]u8 = undefined;
+        const magic_text = std.fmt.bufPrint(&magic_buf, "{s}/{s}", .{
+            if (h.magic == magic) "ok" else "bad",
+            if (c.footer) |f| (if (f.magic == magic) "ok" else "bad") else "-",
+        }) catch "?";
+        var ver_buf: [16]u8 = undefined;
+        const ver = std.fmt.bufPrint(&ver_buf, "{f}", .{h.version}) catch "?";
+        var sync_buf: [32]u8 = undefined;
+        const sync = std.fmt.bufPrint(&sync_buf, "{d}/{d}", .{ h.sync_serial, if (c.footer) |f| f.sync_serial else 0 }) catch "?";
+        var pc_buf: [32]u8 = undefined;
+        const pc = std.fmt.bufPrint(&pc_buf, "{d}/{d}", .{ h.phase, h.cycle }) catch "?";
+        var wp_buf: [24]u8 = undefined;
+        const wp = std.fmt.bufPrint(&wp_buf, "{d}", .{h.write_pos}) catch "?";
+        try out.print("  {s: <4}  {s: <10}  {s: <9}  {s: >9}  {d: >9}  {s: >12}  {s}\n", .{ name, magic_text, ver, sync, h.write_serial, wp, pc });
+    }
+
+    if (r.header) |h| {
+        try out.print("\nusing       copy {s}\n", .{r.using.?});
+        const into = @as(i64, @intCast(r.content_start));
+        try out.print("write_pos   {d} ({d} bytes into the content area), phase {d}, cycle {d}\n", .{ h.write_pos, h.write_pos - into, h.phase, h.cycle });
+        try out.print("agg_pos     {d}   last_write_pos {d}\n", .{ h.agg_pos, h.last_write_pos });
+        try out.print("created     {d} (unix time)   generation {d}   sector_size {d}   dirty {d}\n", .{ h.create_time, h.generation, h.sector_size, h.dirty });
+        if (r.freelist.len <= 8) {
+            try out.print("freelist    {any}\n", .{r.freelist});
+        } else {
+            try out.print("freelist    {d} segments: {any} ...\n", .{ r.freelist.len, r.freelist[0..8] });
+        }
+    } else {
+        try out.writeAll("\nusing       none\n");
+    }
+
+    if (r.issues.len != 0) {
+        try out.writeAll("\n");
+        for (r.issues) |issue| try out.print("{s}: {s}\n", .{ @tagName(issue.severity), issue.message });
+    }
+    if (r.diagnosis) |d| try printDiagnosis(out, r, d);
+}
+
+fn printDiagnosis(out: *Io.Writer, r: StripeReport, d: cyclone.stripe.Diagnosis) !void {
+    try out.print("\nfound the footer of copy A: each directory copy is {d} bytes, not {d}\n", .{ d.dir_len, r.dir_len });
+    if (d.candidates.len == 0) {
+        try out.writeAll("no avg_obj_size between 64 and 4M gives that size\n");
+        return;
+    }
+    const lo = d.candidates[0].avg_min;
+    const hi = d.candidates[d.candidates.len - 1].avg_max;
+    try out.print("avg_obj_size values {d}..{d} give that size, with {d} different bucket counts\n", .{ lo, hi, d.candidates.len });
+    if (d.candidates.len <= 6) {
+        for (d.candidates) |c| try out.print("  {d}..{d}: {d} segments x {d} buckets\n", .{ c.avg_min, c.avg_max, c.segments, c.buckets });
+    }
+    // Configured values tend to be round numbers.
+    try out.writeAll("round values in that range:");
+    var shown: usize = 0;
+    var v = (lo + 999) / 1000 * 1000;
+    while (v <= hi and shown < 8) : (v += 1000) {
+        try out.print(" {d}", .{v});
+        shown += 1;
+    }
+    var p: u32 = 64;
+    while (p <= hi) : (p *= 2) if (p >= lo and p % 1000 != 0) try out.print(" {d}", .{p});
+    try out.print("\nretry with --avg-obj-size {d}=N, using the configured value: lookups need the exact bucket count\n", .{r.volume});
 }
 
 fn describeOpenError(err: cyclone.span.OpenError) []const u8 {

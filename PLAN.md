@@ -151,5 +151,6 @@ A daemon (`cyclone-d`) that opens the spans once, keeps stripe headers and direc
 2. ~~`cyc-key`~~ done: `src/url.zig` ports `url_parse` + `url_CryptoHash_get_general` (and the 9.2 variant). Its output matches keys from ATS master's own code (`tools/ats-keygen`, golden data in `src/testdata/`) for 68 URLs × 4 option sets. SHA-256 output is not yet checked against a FIPS build.
 3. `docs/format.md` + decoders for the span header, stripe header and `Dir`, then `cyc-doc span|stripe|dir` against a fixture.
    - ~~Span~~ done: `src/format/span.zig`, `src/span.zig`, `cyc-doc span`, matches ATS's own log for the fixture. Fixture: `tools/fixture/make-fixture.sh ATS_PREFIX tests/fixtures/basic`.
-   - Next: the stripe header. Stripe geometry depends on each volume's `avg_obj_size` (storage.yaml can override it per volume), so it needs a CLI option or inference from where the footer magic is.
+   - ~~Stripe~~ done: `src/format/stripe.zig`, `src/stripe.zig`, `cyc-doc stripe`. Geometry comes from `--avg-obj-size [VOL=]N`. If the footer is not where that puts it, a footer scan reports the matching `avg_obj_size` range (exact value still needed for bucket count).
+   - Next: decode `Dir` entries (`cyc-doc dir`): walk buckets and chains, free lists, stats.
 4. Lookup (stripe hash table + bucket walk), then HTTPInfo decoding, then whole-object `cyc-doc`.

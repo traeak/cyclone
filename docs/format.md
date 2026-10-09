@@ -94,3 +94,79 @@ use the same seed ATS used (`--seed`).
 Verified against the fixture (`tools/fixture/make-fixture.sh`): ATS logged
 `Stripe seed-span1 16384:16384` and `.../span0.db 134234112:32768`, and
 `cyc-doc span` reports the same values.
+
+## Stripe
+
+One used `DiskStripeBlock` = one stripe (`src/iocore/cache/Stripe.{h,cc}`,
+`StripeSM.cc`). The stripe's `skip` is the block's `offset`, and its `len`
+is `block.len * 8192` bytes.
+
+### Layout
+
+```
+skip ──► copy A:  header   StripeHeaderFooter + u16 freelist[segments]   rounded to 8 KB  (headerlen)
+                  entries  segments × buckets × 4 × 10-byte Dir           rounded to 8 KB
+                  footer   StripeHeaderFooter                             rounded to 8 KB
+         copy B:  same, at skip + dirlen
+start ─► content area (the cyclone buffer), to skip + len
+```
+`dirlen = headerlen + entries + footer` and `start = skip + 2 * dirlen`.
+
+### Geometry (`Stripe::_init_data`)
+
+The directory is sized from the stripe length and the volume's
+`avg_obj_size`. That is storage.yaml `volumes[].avg_obj_size` if set,
+otherwise `proxy.config.cache.min_average_object_size` (default 8000). Each
+pass sizes the directory from the space the previous pass left for content:
+
+```
+start = skip
+repeat 3 times:
+    total_entries = (len - (start - skip)) / avg_obj_size
+    total_buckets = total_entries / 4
+    segments      = ceil(total_buckets / 16384)        # a segment holds at most 16384 buckets
+    buckets       = ceil(total_buckets / segments)     # buckets per segment
+    start         = skip + 2 * dirlen
+```
+`avg_obj_size` is not stored on disk, so `--avg-obj-size [VOL=]N` supplies it.
+If the footer is not where that value puts it, `cyc-doc stripe` scans for
+copy A's footer (a block matching header A's magic, sync serial and create
+time) and reports which `avg_obj_size` values give that directory length.
+Many values give the same length but different bucket counts, and lookups
+need the exact bucket count, so the configured value is still required.
+
+Verified against the fixture: ATS logged 188416 directory bytes for a
+128 MB stripe and 352256 for a 256 MB one, which matches the computed
+`dirlen` (1 × 4182 and 1 × 8366 buckets).
+
+### `StripeHeaderFooter` (72 bytes + freelist)
+
+| Offset | Type | Field | Meaning |
+|---|---|---|---|
+| 0 | u32 | `magic` | `0xF1D0F00D` |
+| 4 | u16, u16 | `version` | major, minor; master writes 24.3 and reads majors 21–24 |
+| 8 | i64 | `create_time` | unix time the stripe was initialized |
+| 16 | i64 | `write_pos` | next write position, byte offset in the span |
+| 24 | i64 | `last_write_pos` | |
+| 32 | i64 | `agg_pos` | |
+| 40 | u32 | `generation` | commented "token generation, cannot be 0", but master never sets it (0) |
+| 44 | u32 | `phase` | flips each time `write_pos` wraps |
+| 48 | u32 | `cycle` | number of wraps |
+| 52 | u32 | `sync_serial` | bumped on each directory sync |
+| 56 | u32 | `write_serial` | |
+| 60 | u32 | `dirty` | the periodic sync clears it before writing; the shutdown sync writes it set |
+| 64 | u32 | `sector_size` | |
+| 68 | u32 | unused | |
+| 72 | u16[segments] | `freelist` | header only: head entry index of each segment's free list |
+
+### Choosing a copy (`StripeSM::handle_header_read`)
+
+With A header/footer serials `ha`/`fa` and B serials `hb`/`fb`:
+
+```
+if ha == fa and (ha >= hb or hb != fb):  use A
+elif hb == fb:                            use B
+else:                                     no usable copy (ATS clears the stripe)
+```
+The chosen copy must then have the magic in header and footer, and a major
+version in 21–24 (`handle_dir_read`).
