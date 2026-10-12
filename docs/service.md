@@ -19,6 +19,7 @@ It takes the same span options as the tools (`--span`, `--seed`, `--skip`,
 | `--max-connections N` | connections served at once (default 256); beyond that, accepting waits |
 | `--record NAME=VALUE` | a records.yaml setting alternate selection follows (`normalize_ae`, `ignore_accept_*_mismatch`, `global_user_agent_header`) |
 | `--disk-directories` | read directories from the spans for each lookup instead of loading them at startup |
+| `--shutdown-timeout S` | on SIGTERM or SIGINT, how long requests in flight may take to finish (default 10) |
 | `--access-log` | one line per request on stderr: method, target, status, bytes, time |
 
 All stripes are opened at startup, and their directories (the copy ATS would
@@ -37,6 +38,19 @@ What a request reads from the spans, with directories in memory:
 
 With `--disk-directories`, each lookup also reads the bucket's entries, 10
 bytes at a time (usually two reads).
+
+## Stopping
+
+On SIGTERM or SIGINT, cyclone-d stops accepting connections and shuts the
+receiving side of every open one: a connection waiting for its next request
+ends at once, and a request being answered is finished (its response says
+`connection: close`). Once every connection has ended, or after
+`--shutdown-timeout` seconds when the rest are cut off, it removes its unix
+socket files and exits 0. A second signal stops it at once.
+
+The signals are read from a `signalfd` (Linux), with SIGTERM and SIGINT
+blocked in every thread, so the shutdown runs as ordinary code rather than in
+a signal handler.
 
 ## Requests
 

@@ -28,16 +28,18 @@ const Field = @import("format/http.zig").Field;
 pub const Options = struct {
     /// Log one line per request to stderr.
     access_log: bool = false,
+    /// Set when the server is shutting down: responses then close the
+    /// connection instead of keeping it alive.
+    stopping: ?*const std.atomic.Value(bool) = null,
 };
 
 const read_buffer_len = 16 * 1024;
 const write_buffer_len = 64 * 1024;
 const body_buffer_len = 64 * 1024;
 
-/// Serves one connection until the client closes it or an error ends it.
-/// Closes `stream`.
+/// Serves one connection until the client closes it, an error ends it, or
+/// the server stops. The caller closes `stream`.
 pub fn serveConnection(svc: *service.Service, io: Io, stream: net.Stream, options: Options) void {
-    defer stream.close(io);
     const gpa = svc.cache.gpa;
     const buffers = gpa.alloc(u8, read_buffer_len + write_buffer_len + body_buffer_len) catch return;
     defer gpa.free(buffers);
@@ -75,7 +77,8 @@ fn handle(svc: *service.Service, io: Io, arena: std.mem.Allocator, request: *std
     const start = Io.Clock.awake.now(io);
     const method = request.head.method;
     const target = try arena.dupe(u8, request.head.target);
-    const keep_alive = request.head.keep_alive;
+    const stopping = if (options.stopping) |st| st.load(.acquire) else false;
+    const keep_alive = request.head.keep_alive and !stopping;
 
     var resp: service.Response = undefined;
     if (method != .GET and method != .HEAD) {

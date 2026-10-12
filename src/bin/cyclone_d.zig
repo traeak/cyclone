@@ -8,6 +8,8 @@ const cyclone = @import("cyclone");
 const cli = cyclone.cli;
 const Span = cyclone.Span;
 const http_server = cyclone.http_server;
+const posix = std.posix;
+const linux = std.os.linux;
 
 const usage =
     \\usage: cyclone-d --span PATH... (--unix PATH | --listen HOST:PORT)... [options]
@@ -39,6 +41,10 @@ const usage =
     \\  --disk-directories  read directories from the spans for each lookup instead
     \\                      of loading them into memory at startup (memory: 10 bytes
     \\                      per directory entry, as ATS itself uses)
+    \\  --shutdown-timeout S
+    \\                      on SIGTERM or SIGINT, how long requests in flight may
+    \\                      take to finish before their connections are cut (default
+    \\                      10); a second signal stops at once
     \\  --access-log        log each request to stderr
     \\
 ;
@@ -52,12 +58,43 @@ const Shared = struct {
     svc: *cyclone.service.Service,
     options: http_server.Options,
     max_connections: u32,
+    /// Connections being served.
     active: std.atomic.Value(u32) = .init(0),
+    /// Set on SIGTERM or SIGINT.
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// Sockets of the connections being served, so a shutdown can wake
+    /// them. A connection leaves this before its socket is closed, and the
+    /// shutdown holds `mutex` while it acts, so it never touches a socket
+    /// that was closed and reused.
+    mutex: Io.Mutex = .init,
+    conns: std.AutoArrayHashMapUnmanaged(net.Socket.Handle, void) = .empty,
+    gpa: std.mem.Allocator,
+
+    /// Shuts down every connection's socket in the `how` direction.
+    fn shutdownConnections(shared: *Shared, io: Io, how: net.ShutdownHow) void {
+        shared.mutex.lockUncancelable(io);
+        defer shared.mutex.unlock(io);
+        for (shared.conns.keys()) |h| socketShutdown(io, h, how);
+    }
 };
+
+fn socketShutdown(io: Io, handle: net.Socket.Handle, how: net.ShutdownHow) void {
+    const stream: net.Stream = .{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } };
+    stream.shutdown(io, how) catch {};
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+
+    // SIGTERM and SIGINT are read from a signalfd, not handled: block them
+    // before any task starts, so every thread inherits the mask.
+    var signals = posix.sigemptyset();
+    posix.sigaddset(&signals, .TERM);
+    posix.sigaddset(&signals, .INT);
+    posix.sigprocmask(posix.SIG.BLOCK, &signals, null);
+    const signal_fd = posix.signalfd(-1, &signals, linux.SFD.CLOEXEC) catch |err|
+        cli.fatal("cannot watch for signals: {s}", .{@errorName(err)});
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -69,6 +106,7 @@ pub fn main(init: std.process.Init) !void {
     var options: http_server.Options = .{};
     var max_connections: u32 = 256;
     var disk_directories = false;
+    var shutdown_timeout: u32 = 10;
 
     var it: cli.ArgIterator = .init(args);
     while (it.next()) |arg| {
@@ -89,6 +127,9 @@ pub fn main(init: std.process.Init) !void {
             if (max_connections == 0) cli.fatal("--max-connections must be positive", .{});
         } else if (std.mem.eql(u8, arg, "--record")) {
             cli.parseRecord(&select_config, it.value(arg));
+        } else if (std.mem.eql(u8, arg, "--shutdown-timeout")) {
+            const text = it.value(arg);
+            shutdown_timeout = std.fmt.parseInt(u32, text, 10) catch cli.fatal("bad --shutdown-timeout '{s}'", .{text});
         } else if (std.mem.eql(u8, arg, "--disk-directories")) {
             disk_directories = true;
         } else if (std.mem.eql(u8, arg, "--access-log")) {
@@ -121,7 +162,9 @@ pub fn main(init: std.process.Init) !void {
     if (unusable != 0) std.debug.print("cyclone-d: {d} stripe(s) have no usable directory (is --avg-obj-size right?); their objects will miss\n", .{unusable});
 
     var svc: cyclone.service.Service = .{ .cache = &cache, .select_config = select_config };
-    var shared: Shared = .{ .svc = &svc, .options = options, .max_connections = max_connections };
+    var shared: Shared = .{ .svc = &svc, .options = options, .max_connections = max_connections, .gpa = gpa };
+    shared.options.stopping = &shared.stopping;
+    defer shared.conns.deinit(gpa);
 
     var listeners: std.ArrayList(Listener) = .empty;
     defer for (listeners.items) |*l| l.server.deinit(io);
@@ -138,29 +181,67 @@ pub fn main(init: std.process.Init) !void {
     }
     for (listeners.items) |l| std.debug.print("cyclone-d: listening on {s}\n", .{l.name});
 
-    // One accept loop per listener; the last runs on this thread.
+    // One accept loop per listener; this thread waits for a signal.
     var group: Io.Group = .init;
-    defer group.cancel(io);
-    for (listeners.items[0 .. listeners.items.len - 1]) |*l| {
+    for (listeners.items) |*l| {
         group.concurrent(io, acceptLoop, .{ &shared, io, l }) catch
             cli.fatal("cannot run {d} listeners at once", .{listeners.items.len});
     }
-    acceptLoop(&shared, io, &listeners.items[listeners.items.len - 1]);
+
+    var info: linux.signalfd_siginfo = undefined;
+    const signal_file: Io.File = .{ .handle = signal_fd, .flags = .{ .nonblocking = false } };
+    _ = signal_file.readStreaming(io, &.{std.mem.asBytes(&info)}) catch |err|
+        cli.fatal("reading signals: {s}", .{@errorName(err)});
+    // A second signal stops the process at once.
+    posix.sigprocmask(posix.SIG.UNBLOCK, &signals, null);
+    const name = if (info.signo == @backingInt(posix.SIG.TERM)) "SIGTERM" else "SIGINT";
+    std.debug.print("cyclone-d: {s}: stopping; {d} connection(s) open\n", .{ name, shared.active.load(.monotonic) });
+
+    // Stop accepting, and wake idle connections: with their receiving side
+    // shut, a connection waiting for its next request sees the end, and one
+    // in the middle of a request finishes it and then closes.
+    shared.stopping.store(true, .release);
+    for (listeners.items) |*l| socketShutdown(io, l.server.socket.handle, .recv);
+    shared.shutdownConnections(io, .recv);
+
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(shutdown_timeout));
+    while (shared.active.load(.monotonic) != 0 and Io.Clock.awake.now(io).compare(.lt, deadline)) {
+        io.sleep(.fromMilliseconds(20), .awake) catch break;
+    }
+    const left = shared.active.load(.monotonic);
+    if (left != 0) {
+        std.debug.print("cyclone-d: {d} connection(s) still busy after {d} s; cutting them off\n", .{ left, shutdown_timeout });
+        shared.shutdownConnections(io, .both);
+        const cut = Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (shared.active.load(.monotonic) != 0 and Io.Clock.awake.now(io).compare(.lt, cut)) {
+            io.sleep(.fromMilliseconds(20), .awake) catch break;
+        }
+    }
+    for (unix_paths.items) |path| removeStaleSocket(io, path);
+    if (shared.active.load(.monotonic) != 0) {
+        std.debug.print("cyclone-d: connections did not end; exiting anyway\n", .{});
+        std.process.exit(1);
+    }
+    group.await(io) catch {};
+    std.debug.print("cyclone-d: stopped\n", .{});
 }
 
 fn acceptLoop(shared: *Shared, io: Io, l: *Listener) void {
     var conns: Io.Group = .init;
-    defer conns.cancel(io);
+    defer conns.await(io) catch {};
     while (true) {
-        const stream = l.server.accept(io) catch |err| switch (err) {
-            error.Canceled => return,
-            error.ConnectionAborted => continue,
-            else => {
-                std.debug.print("cyclone-d: {s}: accept: {s}\n", .{ l.name, @errorName(err) });
-                // Out of descriptors and the like: back off a little.
-                io.sleep(.fromMilliseconds(100), .awake) catch return;
-                continue;
-            },
+        const stream = l.server.accept(io) catch |err| {
+            if (shared.stopping.load(.acquire)) return;
+            switch (err) {
+                error.Canceled => return,
+                error.ConnectionAborted => continue,
+                else => {
+                    std.debug.print("cyclone-d: {s}: accept: {s}\n", .{ l.name, @errorName(err) });
+                    // Out of descriptors and the like: back off a little.
+                    io.sleep(.fromMilliseconds(100), .awake) catch return;
+                    continue;
+                },
+            }
         };
         // Beyond the limit, or when no task can start, serve on this one:
         // accepting waits meanwhile.
@@ -173,7 +254,21 @@ fn acceptLoop(shared: *Shared, io: Io, l: *Listener) void {
 
 fn serveCounted(shared: *Shared, io: Io, stream: net.Stream) void {
     defer _ = shared.active.fetchSub(1, .monotonic);
+    const h = stream.socket.handle;
+    {
+        shared.mutex.lockUncancelable(io);
+        defer shared.mutex.unlock(io);
+        shared.conns.put(shared.gpa, h, {}) catch {};
+        // Accepted as the shutdown began: answer one request at most.
+        if (shared.stopping.load(.acquire)) socketShutdown(io, h, .recv);
+    }
     http_server.serveConnection(shared.svc, io, stream, shared.options);
+    {
+        shared.mutex.lockUncancelable(io);
+        defer shared.mutex.unlock(io);
+        _ = shared.conns.swapRemove(h);
+    }
+    stream.close(io);
 }
 
 /// HOST:PORT, with [IPv6]:PORT.

@@ -455,4 +455,51 @@ grep -v -e 'listening on' -e 'directories in memory' "$tmp/log" | sed 's/^/  /' 
 rm -rf "$tmp"
 done
 
+# 11. Graceful shutdown: on SIGTERM an idle keep-alive connection is closed,
+#     a body being read slowly is finished, the daemon exits 0 and removes
+#     its socket file.
+tmp=$(mktemp -d)
+"$bin/cyclone-d" $spans --unix "$tmp/sock" > "$tmp/log" 2>&1 &
+daemon=$!
+for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
+got=$(python3 -I - "$tmp/sock" "$daemon" <<'PY'
+import os, signal, socket, sys, time
+sock, pid = sys.argv[1], int(sys.argv[2])
+def conn():
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(30)
+    s.connect(sock)
+    return s
+idle = conn()
+idle.sendall(b"GET /v1/key?url=http%3A%2F%2Fa%2F HTTP/1.1\r\nHost: c\r\n\r\n")
+time.sleep(0.2)
+idle.recv(65536)
+slow = conn()
+slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+slow.sendall(b"GET /v1/body?url=http%3A%2F%2F127.0.0.1%3A18081%2Fhuge%2F1 HTTP/1.1\r\nHost: c\r\n\r\n")
+time.sleep(0.3)
+os.kill(pid, signal.SIGTERM)
+problems = []
+if idle.recv(100) != b"":
+    problems.append("the idle connection was not closed")
+data = b""
+while True:
+    x = slow.recv(1 << 18)
+    if not x:
+        break
+    data += x
+    time.sleep(0.02)
+if len(data.partition(b"\r\n\r\n")[2]) != 9441283:
+    problems.append("the body in flight was not finished")
+for p in problems:
+    print("  " + p, file=sys.stderr)
+print("%d problems" % len(problems))
+PY
+)
+status=0
+wait $daemon || status=$?
+[ -e "$tmp/sock" ] && got="$got, socket file left"
+check "graceful shutdown (idle connection closed, body in flight finished)" "0 problems, exit 0" "$got, exit $status"
+rm -rf "$tmp"
+
 exit $fail
