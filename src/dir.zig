@@ -118,9 +118,10 @@ pub const ChainIterator = struct {
     }
 };
 
-/// One bucket's chain, read from disk an entry at a time: a lookup visits a
-/// few entries, where `Segment.read` loads up to 640 KB.
-pub const DiskChain = struct {
+/// One bucket's chain, an entry at a time: from the stripe's directory in
+/// memory when it is loaded (`Stripe.loadDirectory`), else from the span,
+/// where a lookup visits a few entries instead of `Segment.read`'s 640 KB.
+pub const BucketChain = struct {
     io: Io,
     stripe: *const Stripe,
     /// Byte offset of the segment's first entry.
@@ -130,12 +131,12 @@ pub const DiskChain = struct {
     steps: u64 = 0,
     err: ?ChainError = null,
 
-    pub fn init(io: Io, stripe: *const Stripe, segment: u64, bucket: u64) !DiskChain {
+    pub fn init(io: Io, stripe: *const Stripe, segment: u64, bucket: u64) !BucketChain {
         const copy = stripe.chosen orelse return error.NoUsableDirectory;
         const g = stripe.geometry;
         if (segment >= g.segments or bucket >= g.buckets) return error.NoSuchBucket;
         const entries = g.buckets * fmt.depth;
-        var it: DiskChain = .{
+        var it: BucketChain = .{
             .io = io,
             .stripe = stripe,
             .base = g.entriesOffset(copy) + segment * entries * fmt.entry_len,
@@ -148,13 +149,18 @@ pub const DiskChain = struct {
         return it;
     }
 
-    fn read(it: *const DiskChain, i: u64) !Dir {
+    fn read(it: *const BucketChain, i: u64) !Dir {
+        const at = it.base + i * fmt.entry_len;
+        if (it.stripe.entries) |mem| {
+            const rel = at - it.stripe.geometry.entriesOffset(it.stripe.chosen.?);
+            return Dir.decode(mem[@intCast(rel)..][0..fmt.entry_len]);
+        }
         var b: [fmt.entry_len]u8 = undefined;
-        if (try it.stripe.span.file.readPositionalAll(it.io, &b, it.base + i * fmt.entry_len) != b.len) return error.Truncated;
+        if (try it.stripe.span.file.readPositionalAll(it.io, &b, at) != b.len) return error.Truncated;
         return Dir.decode(&b);
     }
 
-    pub fn next(it: *DiskChain) !?Link {
+    pub fn next(it: *BucketChain) !?Link {
         const i = it.next_index orelse return null;
         if (i >= it.entries) {
             it.err = .bad_next;
@@ -348,6 +354,28 @@ test "chains, free list and stats" {
     try testing.expectEqual(1, st.chain_lengths[2]);
     try testing.expectEqual(0, st.problems());
     try testing.expectEqual(1 * 512 + 1 * 512 + 1 * 512, st.approx_bytes);
+}
+
+test "bucket chains walk the directory in memory as on disk" {
+    var raw: [4 * fmt.depth * fmt.entry_len]u8 = @splat(0);
+    putEntry(&raw, 0, 1, 5, true);
+    putEntry(&raw, 5, 3, 9, false);
+    putEntry(&raw, 9, 5, 0, false);
+    var stripe = testStripe();
+    stripe.entries = &raw;
+    const seg: Segment = .{ .index = 0, .buckets = 4, .freelist_head = 0, .raw = &raw };
+
+    // `span` is never touched: every entry comes from memory.
+    var chain = try BucketChain.init(undefined, &stripe, 0, 0);
+    var want = seg.chain(0);
+    while (want.next()) |w| {
+        const got = (try chain.next()).?;
+        try testing.expectEqual(w.index, got.index);
+        try testing.expectEqual(w.dir.offset(), got.dir.offset());
+    }
+    try testing.expectEqual(null, try chain.next());
+    var empty = try BucketChain.init(undefined, &stripe, 0, 2);
+    try testing.expectEqual(null, try empty.next());
 }
 
 test "broken chains are reported, not followed forever" {

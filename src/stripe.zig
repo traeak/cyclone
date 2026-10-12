@@ -41,6 +41,10 @@ pub const Stripe = struct {
     /// `freelist[segments]` of the chosen copy: head entry of each
     /// segment's free list. Empty when no copy is usable.
     freelist: []u16,
+    /// The chosen copy's entries, as on disk (10 bytes each, segment after
+    /// segment), once `loadDirectory` has read them. Null: lookups read
+    /// the directory from the span.
+    entries: ?[]u8 = null,
 
     /// Reads the stripe's directory headers and footers. Fails only on I/O
     /// errors; an unusable stripe opens with `chosen == null`.
@@ -88,7 +92,29 @@ pub const Stripe = struct {
 
     pub fn close(self: *Stripe, gpa: std.mem.Allocator) void {
         gpa.free(self.freelist);
+        if (self.entries) |e| gpa.free(e);
         self.* = undefined;
+    }
+
+    /// Reads the chosen copy's entries into memory, as ATS keeps them, so a
+    /// lookup walks its bucket without reading the span. Takes
+    /// `geometry.entryCount() * 10` bytes. Does nothing for a stripe with
+    /// no usable directory, or one already loaded.
+    pub fn loadDirectory(self: *Stripe, gpa: std.mem.Allocator, io: Io) !void {
+        if (self.entries != null) return;
+        const copy = self.chosen orelse return;
+        const g = self.geometry;
+        const raw = try gpa.alloc(u8, g.entryCount() * fmt.dir_entry_len);
+        errdefer gpa.free(raw);
+        // A segment (at most 640 KB) per read.
+        const seg_len = g.buckets * fmt.dir_depth * fmt.dir_entry_len;
+        const base = g.entriesOffset(copy);
+        var off: u64 = 0;
+        while (off < raw.len) : (off += seg_len) {
+            const chunk = raw[@intCast(off)..][0..@intCast(seg_len)];
+            if (try self.span.file.readPositionalAll(io, chunk, base + off) != chunk.len) return error.Truncated;
+        }
+        self.entries = raw;
     }
 
     /// Header of the copy in use.

@@ -150,6 +150,40 @@ pub const Cache = struct {
         return unusable;
     }
 
+    /// Reads the directory of every open stripe into memory, one task per
+    /// stripe, so stripes on different disks load at once. Lookups then
+    /// walk buckets without reading the spans. Returns the bytes held.
+    pub fn loadDirectories(self: *Cache) !u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const stripes = try self.gpa.alloc(*Stripe, self.open.count());
+        defer self.gpa.free(stripes);
+        const results = try self.gpa.alloc(?anyerror, stripes.len);
+        defer self.gpa.free(results);
+        var it = self.open.valueIterator();
+        var n: usize = 0;
+        while (it.next()) |s| : (n += 1) stripes[n] = s.*;
+
+        var group: Io.Group = .init;
+        for (stripes, results) |s, *r| {
+            r.* = null;
+            group.async(self.io, loadOne, .{ self.gpa, self.io, s, r });
+        }
+        try group.await(self.io);
+        var bytes: u64 = 0;
+        for (stripes, results) |s, r| {
+            if (r) |err| return err;
+            if (s.entries) |e| bytes += e.len;
+        }
+        return bytes;
+    }
+
+    fn loadOne(gpa: std.mem.Allocator, io: Io, s: *Stripe, result: *?anyerror) void {
+        s.loadDirectory(gpa, io) catch |err| {
+            result.* = err;
+        };
+    }
+
     /// The table entry for the stripe ATS stores `key`'s object in.
     pub fn home(self: *const Cache, key: *const CacheKey) *const assign.StripeRef {
         return self.table.stripeFor(key);
@@ -167,7 +201,7 @@ pub const Cache = struct {
         const slot = dir.Slot.of(key, s.geometry.segments, s.geometry.buckets);
         var p: Probe = .{ .slot = slot };
         var candidates: std.ArrayList(Candidate) = .empty;
-        var chain = try dir.DiskChain.init(self.io, s, slot.segment, slot.bucket);
+        var chain = try dir.BucketChain.init(self.io, s, slot.segment, slot.bucket);
         while (try chain.next()) |link| {
             p.chain_length += 1;
             const d = link.dir;

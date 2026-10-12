@@ -38,6 +38,24 @@ pub fn readFragment(gpa: std.mem.Allocator, io: Io, file: Io.File, hash_type: ha
     return buf;
 }
 
+/// Like `readFragment`, in one read instead of two: `size` (a directory
+/// entry's approximate size, which is never less than the fragment) is read
+/// and the fragment cut from it. A Doc claiming more is `error.TooLong`.
+pub fn readFragmentWithin(gpa: std.mem.Allocator, io: Io, file: Io.File, hash_type: hash.HashType, offset: u64, size: u64) ![]u8 {
+    const n = fmt.headerLen(hash_type);
+    var buf = try gpa.alloc(u8, @intCast(@max(size, n)));
+    errdefer gpa.free(buf);
+    const got = try file.readPositionalAll(io, buf, offset);
+    if (got < n) return error.Truncated;
+    const doc = Doc.decode(hash_type, buf[0..n]);
+    if (doc.magic != fmt.magic) return error.BadMagic;
+    if (doc.len < n) return error.TooShort;
+    if (doc.len > buf.len) return error.TooLong;
+    if (doc.len > got) return error.Truncated;
+    buf = try gpa.realloc(buf, doc.len);
+    return buf;
+}
+
 /// The alternates in an HTTP fragment's header. `fragment` is the whole
 /// fragment as `readFragment` returns it; strings point into it. Allocates;
 /// pass an arena.

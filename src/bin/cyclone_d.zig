@@ -34,6 +34,9 @@ const usage =
     \\                      accepting waits
     \\  --record NAME=VALUE a records.yaml setting alternate selection follows (see
     \\                      cyc-doc --help)
+    \\  --disk-directories  read directories from the spans for each lookup instead
+    \\                      of loading them into memory at startup (memory: 10 bytes
+    \\                      per directory entry, as ATS itself uses)
     \\  --access-log        log each request to stderr
     \\
 ;
@@ -63,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     var select_config: cyclone.select.Config = .{};
     var options: http_server.Options = .{};
     var max_connections: u32 = 256;
+    var disk_directories = false;
 
     var it: cli.ArgIterator = .init(args);
     while (it.next()) |arg| {
@@ -83,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
             if (max_connections == 0) cli.fatal("--max-connections must be positive", .{});
         } else if (std.mem.eql(u8, arg, "--record")) {
             cli.parseRecord(&select_config, it.value(arg));
+        } else if (std.mem.eql(u8, arg, "--disk-directories")) {
+            disk_directories = true;
         } else if (std.mem.eql(u8, arg, "--access-log")) {
             options.access_log = true;
         } else {
@@ -104,6 +110,12 @@ pub fn main(init: std.process.Init) !void {
     };
     defer cache.deinit();
     const unusable = try cache.openAll();
+    if (!disk_directories) {
+        const t0 = Io.Clock.awake.now(io);
+        const bytes = cache.loadDirectories() catch |err| cli.fatal("cannot load the directories: {s}", .{@errorName(err)});
+        const ms = t0.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+        std.debug.print("cyclone-d: directories in memory: {Bi:.1} in {d} ms\n", .{ bytes, ms });
+    }
     if (unusable != 0) std.debug.print("cyclone-d: {d} stripe(s) have no usable directory (is --avg-obj-size right?); their objects will miss\n", .{unusable});
 
     var svc: cyclone.service.Service = .{ .cache = &cache, .select_config = select_config };

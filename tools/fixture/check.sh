@@ -249,12 +249,16 @@ else
   echo "skip  alternate selection (no $fix/select.tsv; rerun make-fixture.sh)"
 fi
 
-# 10. The service: cyclone-d on a unix socket answers as the tools do.
+# 10. The service: cyclone-d on a unix socket answers as the tools do, with
+#     its directories in memory and read from disk.
 #     Bodies of every alternate, selection as ATS served it (select.tsv),
 #     ranges, If-Range, HEAD, JSON reports, errors, keep-alive, and many
 #     connections at once.
+for mode in "" --disk-directories; do
+label=${mode:+directories on disk}
+label=${label:-directories in memory}
 tmp=$(mktemp -d)
-"$bin/cyclone-d" $spans --unix "$tmp/sock" 2> "$tmp/log" &
+"$bin/cyclone-d" $spans --unix "$tmp/sock" $mode 2> "$tmp/log" &
 daemon=$!
 for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
 got=$(python3 -I - "$bin" "$tmp/sock" "$fix/manifest.tsv" "$fix/select.tsv" $spans <<'PY'
@@ -398,9 +402,10 @@ print("%d problems\t%d" % (len(bad), n))
 PY
 )
 kill $daemon 2>/dev/null; wait $daemon 2>/dev/null || true
-check "service ($(echo "$got" | cut -f2) requests over one socket, 32 at once)" "0 problems" "$(echo "$got" | cut -f1)"
+check "service, $label ($(echo "$got" | cut -f2) requests over one socket, 32 at once)" "0 problems" "$(echo "$got" | cut -f1)"
 # Anything the daemon said besides starting up is worth seeing.
-grep -v 'listening on' "$tmp/log" | sed 's/^/  /' >&2 || true
+grep -v -e 'listening on' -e 'directories in memory' "$tmp/log" | sed 's/^/  /' >&2 || true
 rm -rf "$tmp"
+done
 
 exit $fail

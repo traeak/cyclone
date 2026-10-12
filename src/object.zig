@@ -43,7 +43,7 @@ pub fn openHead(arena: std.mem.Allocator, cache: *Cache, key: *const CacheKey) !
     if (s.chosen == null) return error.NoUsableDirectory;
     const entry = (try cache.find(s, key, .head)) orelse return null;
     const d = entry.doc.?;
-    const frag = try doc_mod.readFragment(arena, cache.io, s.span.file, cache.config.hash_type, entry.offset, @min(entry.dir.approxSize(), max_fragment_len));
+    const frag = try doc_mod.readFragmentWithin(arena, cache.io, s.span.file, cache.config.hash_type, entry.offset, @min(entry.dir.approxSize(), max_fragment_len));
     var alts: []const http.Alternate = &.{};
     if (d.doc_type == .http) {
         if (d.hlen == 0) return error.HttpHeadWithoutHeader;
