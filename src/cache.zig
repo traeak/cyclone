@@ -94,6 +94,9 @@ pub const Cache = struct {
     /// Stripes opened so far, by span and block index. Heap-allocated so
     /// pointers stay put.
     open: std.AutoHashMapUnmanaged([2]usize, *Stripe) = .empty,
+    /// Guards `open`, so tasks can share the cache. Everything else is
+    /// read-only once opened, and reads are positional.
+    mutex: Io.Mutex = .init,
 
     /// `spans` must stay open, in configuration order, for the cache's life.
     pub fn init(gpa: std.mem.Allocator, io: Io, spans: []const Span, config: Config) !Cache {
@@ -121,6 +124,8 @@ pub const Cache = struct {
         if (span_index >= self.spans.len) return error.NoSuchStripe;
         const span = &self.spans[span_index];
         if (block_index >= span.blocks.len or span.blocks[block_index].free) return error.NoSuchStripe;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const gop = try self.open.getOrPut(self.gpa, .{ span_index, block_index });
         if (gop.found_existing) return gop.value_ptr.*;
         errdefer _ = self.open.remove(.{ span_index, block_index });
@@ -129,6 +134,20 @@ pub const Cache = struct {
         s.* = try Stripe.open(self.gpa, self.io, span, block_index, self.config.avgObjSize(span.blocks[block_index].number));
         gop.value_ptr.* = s;
         return s;
+    }
+
+    /// Opens every stripe of every span, as a long-running reader wants to
+    /// up front. Returns how many have no usable directory.
+    pub fn openAll(self: *Cache) !usize {
+        var unusable: usize = 0;
+        for (self.spans, 0..) |span, si| {
+            for (span.blocks, 0..) |b, bi| {
+                if (b.free) continue;
+                const s = try self.stripe(si, bi);
+                if (s.chosen == null) unusable += 1;
+            }
+        }
+        return unusable;
     }
 
     /// The table entry for the stripe ATS stores `key`'s object in.

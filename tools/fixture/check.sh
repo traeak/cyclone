@@ -249,4 +249,158 @@ else
   echo "skip  alternate selection (no $fix/select.tsv; rerun make-fixture.sh)"
 fi
 
+# 10. The service: cyclone-d on a unix socket answers as the tools do.
+#     Bodies of every alternate, selection as ATS served it (select.tsv),
+#     ranges, If-Range, HEAD, JSON reports, errors, keep-alive, and many
+#     connections at once.
+tmp=$(mktemp -d)
+"$bin/cyclone-d" $spans --unix "$tmp/sock" 2> "$tmp/log" &
+daemon=$!
+for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
+got=$(python3 -I - "$bin" "$tmp/sock" "$fix/manifest.tsv" "$fix/select.tsv" $spans <<'PY'
+import concurrent.futures, hashlib, json, os, socket, subprocess, sys, urllib.parse
+bindir, sock, manifest, select_tsv, spans = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+tool = os.path.join(bindir, "cyc-doc")
+lookup_tool = os.path.join(bindir, "cyc-lookup")
+
+class Conn:
+    """A minimal HTTP/1.1 client: exactly the header fields given."""
+    def __init__(self):
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.connect(sock)
+        self.buf = b""
+    def _read_until(self, sep):
+        while sep not in self.buf:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise EOFError
+            self.buf += chunk
+        i = self.buf.index(sep) + len(sep)
+        out, self.buf = self.buf[:i], self.buf[i:]
+        return out
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise EOFError
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+    def get(self, target, fields=(), method="GET"):
+        req = "%s %s HTTP/1.1\r\nHost: cyclone\r\n" % (method, target)
+        req += "".join("%s\r\n" % f for f in fields) + "\r\n"
+        self.s.sendall(req.encode())
+        head = self._read_until(b"\r\n\r\n").decode("latin-1").split("\r\n")
+        status = int(head[0].split()[1])
+        hdrs = {}
+        for line in head[1:]:
+            if line:
+                k, _, v = line.partition(":")
+                hdrs[k.strip().lower()] = v.strip()
+        n = int(hdrs.get("content-length", "0"))
+        body = b"" if method == "HEAD" else self._read(n)
+        return status, hdrs, body
+
+def q(url):
+    return urllib.parse.quote(url, safe="")
+
+bad = []
+n = 0
+c = Conn()
+urls = sorted({l.split("\t")[0] for l in open(manifest).read().splitlines()[1:]})
+
+# Bodies of every alternate, and the reports.
+for url in urls:
+    doc = json.loads(subprocess.run([tool, "object", *spans, url, "--alt", "0", "--json"], capture_output=True, text=True).stdout)
+    st, h, b = c.get("/v1/object?url=%s&alt=0" % q(url))
+    n += 1
+    if st != 200 or json.loads(b) != doc:
+        bad.append("%s: /v1/object differs from cyc-doc object --json" % url)
+    lk = json.loads(subprocess.run([lookup_tool, *spans, url, "--json"], capture_output=True, text=True).stdout)
+    lk = lk[0] if isinstance(lk, list) else lk
+    st, h, b = c.get("/v1/lookup?url=%s" % q(url))
+    n += 1
+    if st != 200 or json.loads(b) != lk:
+        bad.append("%s: /v1/lookup differs from cyc-lookup --json" % url)
+    for alt in doc["alternates"]:
+        i, size = alt["index"], alt["object_size"]
+        whole = subprocess.run([tool, "object", *spans, url, "--alt", str(i), "--body"], capture_output=True).stdout
+        st, h, b = c.get("/v1/body?url=%s&alt=%d" % (q(url), i))
+        n += 1
+        if st != alt["status"] or b != whole or h.get("x-cyclone-alternate") != str(i):
+            bad.append("%s alt %d: body differs (status %d)" % (url, i, st))
+        st, h, b = c.get("/v1/body/%s?alt=%d" % (doc["key"], i), method="HEAD")
+        n += 1
+        if st != 200 or h.get("content-length") != str(size):
+            bad.append("%s alt %d: HEAD gives %d, length %s" % (url, i, st, h.get("content-length")))
+        lm = next((f["value"] for f in alt["response_fields"] if f["name"].lower() == "last-modified"), None)
+        cases = [("bytes=%d-%d" % (size // 3, 2 * size // 3), None, 206, whole[size // 3:2 * size // 3 + 1]),
+                 ("bytes=-7", None, 206, whole[-7:]),
+                 ("bytes=%d-" % (size - 1), None, 206, whole[-1:]),
+                 ("bytes=%d-" % size, None, 416, None),
+                 ("bytes=0-1,5-6", None, 200, whole),
+                 ("bytes=0-0", "Mon, 01 Jan 2001 00:00:00 GMT", 200, whole)]
+        if lm:
+            cases.append(("bytes=0-0", lm, 206, whole[:1]))
+        for rng, if_range, want_status, want in cases:
+            fields = ["Range: " + rng] + (["If-Range: " + if_range] if if_range else [])
+            st, h, b = c.get("/v1/body?url=%s&alt=%d" % (q(url), i), fields)
+            n += 1
+            if st != want_status or (want is not None and b != want):
+                bad.append("%s alt %d %s%s: status %d, want %d" % (url, i, rng, " If-Range" if if_range else "", st, want_status))
+            if st == 416 and h.get("content-range") != "bytes */%d" % size:
+                bad.append("%s alt %d: 416 without Content-Range bytes */%d" % (url, i, size))
+
+# Selection by the request's own fields, as ATS served (select.tsv).
+for line in open(select_tsv).read().splitlines()[1:]:
+    url, hdr, status, length, sha = line.split("\t")
+    fields = ["Accept: */*"] if hdr == "-" else [hdr] if hdr.startswith("Accept:") else ["Accept: */*", hdr]
+    st, h, b = c.get("/v1/body?url=" + q(url), fields)
+    n += 1
+    if status == "200":
+        if st != 200 or hashlib.sha256(b).hexdigest() != sha:
+            bad.append("%s [%s]: ATS served %s, cyclone-d %d" % (url, hdr, sha[:12], st))
+    elif st != 404 or h.get("x-cyclone-cache") != "no-match":
+        bad.append("%s [%s]: ATS had no match, cyclone-d %d %s" % (url, hdr, st, h.get("x-cyclone-cache")))
+
+# Errors.
+for target, method, want in [("/v1/body?url=" + q("http://127.0.0.1:18081/never"), "GET", 404),
+                             ("/v1/body/zz", "GET", 400), ("/nope", "GET", 404),
+                             ("/v1/body/00000000000000000000000000000000?alt=x", "GET", 400),
+                             ("/v1/object", "GET", 400)]:
+    st, h, b = c.get(target, method=method)
+    n += 1
+    if st != want:
+        bad.append("%s: status %d, want %d" % (target, st, want))
+c.s.sendall(b"POST /v1/body/x HTTP/1.1\r\nHost: c\r\nContent-Length: 0\r\n\r\n")
+n += 1
+if b" 405 " not in c._read_until(b"\r\n\r\n"):
+    bad.append("POST is not refused with 405")
+
+# Many connections at once, each reading every large body.
+big = [u for u in urls if "/large/" in u or "/huge/" in u]
+want = {u: subprocess.run([tool, "object", *spans, u, "--body"], capture_output=True).stdout for u in big}
+def worker(k):
+    w = Conn()
+    errs = []
+    for u in big[k % len(big):] + big[:k % len(big)]:
+        st, h, b = w.get("/v1/body?url=" + q(u))
+        if st != 200 or b != want[u]:
+            errs.append("concurrent %s: status %d, %d bytes" % (u, st, len(b)))
+    return errs
+with concurrent.futures.ThreadPoolExecutor(32) as ex:
+    for errs in ex.map(worker, range(32)):
+        bad += errs
+n += 32 * len(big)
+for b in bad:
+    print("  " + b, file=sys.stderr)
+print("%d problems\t%d" % (len(bad), n))
+PY
+)
+kill $daemon 2>/dev/null; wait $daemon 2>/dev/null || true
+check "service ($(echo "$got" | cut -f2) requests over one socket, 32 at once)" "0 problems" "$(echo "$got" | cut -f1)"
+# Anything the daemon said besides starting up is worth seeing.
+grep -v 'listening on' "$tmp/log" | sed 's/^/  /' >&2 || true
+rm -rf "$tmp"
+
 exit $fail

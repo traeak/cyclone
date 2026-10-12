@@ -5,6 +5,7 @@ const HashType = @import("hash.zig").HashType;
 const cache = @import("cache.zig");
 const url = @import("url.zig");
 const CacheKey = @import("key.zig").CacheKey;
+const select = @import("select.zig");
 const default_avg_obj_size = @import("format/stripe.zig").default_avg_obj_size;
 
 /// Walks argv one option at a time.
@@ -117,6 +118,36 @@ pub const Common = struct {
         return &self.spans.items[self.spans.items.len - 1];
     }
 };
+
+/// `--record NAME=VALUE`: a records.yaml setting that changes alternate
+/// selection.
+pub fn parseRecord(cfg: *select.Config, text: []const u8) void {
+    const eq = std.mem.indexOfScalar(u8, text, '=') orelse fatal("--record wants NAME=VALUE, got '{s}'", .{text});
+    const name = text[0..eq];
+    const value = text[eq + 1 ..];
+    if (std.mem.eql(u8, name, "proxy.config.http.global_user_agent_header")) {
+        cfg.global_user_agent_header = value.len != 0;
+        return;
+    }
+    const n = std.fmt.parseInt(u8, value, 10) catch fatal("--record {s}: bad value '{s}'", .{ name, value });
+    const ignore = .{
+        .{ "proxy.config.http.cache.ignore_accept_mismatch", "ignore_accept_mismatch" },
+        .{ "proxy.config.http.cache.ignore_accept_charset_mismatch", "ignore_accept_charset_mismatch" },
+        .{ "proxy.config.http.cache.ignore_accept_encoding_mismatch", "ignore_accept_encoding_mismatch" },
+        .{ "proxy.config.http.cache.ignore_accept_language_mismatch", "ignore_accept_language_mismatch" },
+    };
+    inline for (ignore) |r| if (std.mem.eql(u8, name, r[0])) {
+        if (n > 2) fatal("--record {s}: want 0, 1 or 2", .{name});
+        @field(cfg, r[1]) = @intCast(n);
+        return;
+    };
+    if (std.mem.eql(u8, name, "proxy.config.http.normalize_ae")) {
+        if (n > 5) fatal("--record {s}: want 0 to 5", .{name});
+        cfg.normalize_ae = @intCast(n);
+        return;
+    }
+    fatal("--record: '{s}' does not change alternate selection", .{name});
+}
 
 /// Prints `cyc: <message>` to stderr and exits with status 2.
 /// A cache key given as hex (as cyc-key prints it), or else a URL to make

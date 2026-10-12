@@ -144,86 +144,7 @@ pub fn main(init: std.process.Init) !void {
     if (failed) std.process.exit(1);
 }
 
-const Candidate = struct {
-    /// Entry index within the segment.
-    index: u16,
-    /// Byte offset in the span.
-    offset: u64,
-    approx_size: u64,
-    head: bool,
-    pinned: bool,
-    phase: u1,
-    valid: bool,
-    verdict: ?cyclone.doc.Verdict = null,
-    /// Set when the Doc has the right magic.
-    doc: ?DocInfo = null,
-    read_error: ?[]const u8 = null,
-};
-
-/// The Doc fields worth showing for a lookup.
-const DocInfo = struct {
-    len: u32,
-    total_len: u64,
-    hlen: u32,
-    data_len: u64,
-    doc_type: []const u8,
-    version: []const u8,
-    first_key: []const u8,
-    key: []const u8,
-    pinned_until: u32,
-
-    fn init(arena: std.mem.Allocator, d: cyclone.doc.Doc) !DocInfo {
-        return .{
-            .len = d.len,
-            .total_len = d.total_len,
-            .hlen = d.hlen,
-            .data_len = d.dataLen(),
-            .doc_type = docTypeName(d.doc_type),
-            .version = try std.fmt.allocPrint(arena, "{d}.{d}", .{ d.v_major, d.v_minor }),
-            .first_key = try std.fmt.allocPrint(arena, "{f}", .{d.first_key}),
-            .key = try std.fmt.allocPrint(arena, "{f}", .{d.key}),
-            .pinned_until = d.pinned,
-        };
-    }
-};
-
-fn docTypeName(t: cyclone.doc.FragType) []const u8 {
-    return switch (t) {
-        .none => "none",
-        .unused_1 => "unused_1",
-        .rtsp => "rtsp",
-        .http => "http",
-        _ => "unknown",
-    };
-}
-
-const Status = enum {
-    /// A valid entry whose Doc confirms the key.
-    hit,
-    /// Only stale entries confirm the key.
-    stale,
-    miss,
-};
-
-const Result = struct {
-    input: []const u8,
-    key: ?[]const u8 = null,
-    error_message: ?[]const u8 = null,
-    slot: u32 = 0,
-    span_index: usize = 0,
-    block_index: usize = 0,
-    span: []const u8 = "",
-    volume: i32 = 0,
-    /// Whether the stripe searched is the one ATS assigns the key to.
-    home: bool = true,
-    segment: u64 = 0,
-    bucket: u64 = 0,
-    tag: u12 = 0,
-    /// Entries walked in the bucket's chain.
-    chain_length: u64 = 0,
-    status: Status = .miss,
-    candidates: []const Candidate = &.{},
-};
+const Result = cyclone.report.LookupReport;
 
 /// Looks keys up through a `Cache`, which keeps stripes open.
 const Finder = struct {
@@ -234,62 +155,13 @@ const Finder = struct {
     stripe_override: ?[2]usize,
 
     fn find(f: *Finder, text: []const u8) !Result {
-        var r: Result = .{ .input = text };
-        const key = cli.parseKeyOrUrl(f.hash_type, text) catch |err| {
-            r.error_message = switch (err) {
+        const key = cli.parseKeyOrUrl(f.hash_type, text) catch |err| return .{
+            .input = text,
+            .error_message = switch (err) {
                 error.BadUrl => "not a key, and not a URL that parses",
-            };
-            return r;
+            },
         };
-        r.key = try std.fmt.allocPrint(f.arena, "{f}", .{key});
-        r.slot = assign.Table.slotOf(&key);
-
-        const ref = f.cache.home(&key);
-        const where = f.stripe_override orelse .{ ref.span_index, ref.block_index };
-        r.span_index = where[0];
-        r.block_index = where[1];
-        r.span = f.cache.spans[where[0]].path;
-        r.volume = f.cache.spans[where[0]].blocks[where[1]].number;
-        r.home = f.stripe_override == null or (where[0] == ref.span_index and where[1] == ref.block_index);
-
-        const s = try f.cache.stripe(where[0], where[1]);
-        if (s.chosen == null) {
-            r.error_message = "the stripe has no usable directory (see cyc-doc stripe; is --avg-obj-size right?)";
-            return r;
-        }
-        const p = try f.cache.probe(f.arena, s, &key);
-        r.segment = p.slot.segment;
-        r.bucket = p.slot.bucket;
-        r.tag = p.slot.tag;
-        r.chain_length = p.chain_length;
-
-        const candidates = try f.arena.alloc(Candidate, p.candidates.len);
-        for (p.candidates, candidates) |c, *out| {
-            const d = c.dir;
-            out.* = .{
-                .index = c.index,
-                .offset = c.offset,
-                .approx_size = d.approxSize(),
-                .head = d.head(),
-                .pinned = d.pinned(),
-                .phase = d.phase(),
-                .valid = c.valid,
-                .verdict = c.verdict,
-                .read_error = if (c.read_error) |e| @errorName(e) else null,
-            };
-            if (c.doc) |h| if (c.verdict != .bad_magic) {
-                out.doc = try .init(f.arena, h);
-            };
-            if (c.verdict) |v| if (v.found()) {
-                if (c.valid) r.status = .hit else if (r.status == .miss) r.status = .stale;
-            };
-        }
-        if (p.chain_error) |e| r.error_message = switch (e) {
-            .bad_next => "bucket chain has a next index past the segment",
-            .loop => "bucket chain loops",
-        };
-        r.candidates = candidates;
-        return r;
+        return cyclone.report.lookup(f.arena, f.cache, &key, text, f.stripe_override);
     }
 };
 

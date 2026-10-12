@@ -254,39 +254,90 @@ pub fn chain(arena: std.mem.Allocator, cache: *Cache, head: *const Head, alt: us
     };
 }
 
-/// Writes the chain's range of the body, reading only the bytes needed
-/// from each fragment. Returns the number written; less than the range's
-/// length when fragments are missing.
-pub fn writeBody(cache: *Cache, head: *const Head, c: Chain, w: *Io.Writer) !u64 {
-    var written: u64 = 0;
-    var buf: [64 * 1024]u8 = undefined;
-    for (c.fragments) |f| {
-        const off = f.offset orelse break;
-        // This fragment's share of the range.
-        const lo = @max(f.body_start, c.range.start + written);
-        const hi = @min(f.body_start + f.data_len, c.range.end);
-        if (lo >= hi) continue;
-        if (lo != c.range.start + written) break; // a gap
-        if (f.in_head) {
-            const start = head.doc.prefixLen() + (lo - f.body_start);
-            try w.writeAll(head.fragment[start..][0..@intCast(hi - lo)]);
-        } else {
-            const d = try doc_mod.readHeader(cache.io, head.stripe.span.file, cache.config.hash_type, off);
-            if (d.magic != fmt_doc.magic or !d.key.eql(&f.key) or d.dataLen() != f.data_len) return error.FragmentChanged;
-            var at = off + d.prefixLen() + (lo - f.body_start);
-            var left = hi - lo;
-            while (left != 0) {
-                const n: usize = @intCast(@min(left, buf.len));
-                if (try head.stripe.span.file.readPositionalAll(cache.io, buf[0..n], at) != n) return error.Truncated;
-                try w.writeAll(buf[0..n]);
-                at += n;
-                left -= n;
-            }
-        }
-        written += hi - lo;
-        if (written == c.range.len()) break;
+/// A pull source for the chain's range of the body: each `read` fills the
+/// caller's buffer from the current fragment, so a transport reads as fast
+/// as it can send (or, for HTTP/2, as far as its flow-control window
+/// allows). Each fragment's Doc is checked again when reading reaches it.
+pub const BodyReader = struct {
+    cache: *Cache,
+    head: *const Head,
+    chain: Chain,
+    /// Index into `chain.fragments` of the fragment being read.
+    frag: usize = 0,
+    /// The next body offset to deliver.
+    pos: u64,
+    /// The current fragment's Doc has been checked.
+    checked: bool = false,
+
+    pub const Error = error{
+        /// A fragment is missing (the chain was incomplete).
+        Incomplete,
+        /// A fragment's Doc no longer matches the chain: the cache changed.
+        FragmentChanged,
+        Truncated,
+    } || Io.File.ReadPositionalError;
+
+    pub fn init(cache: *Cache, head: *const Head, c: Chain) BodyReader {
+        return .{ .cache = cache, .head = head, .chain = c, .pos = c.range.start };
     }
-    return written;
+
+    /// Bytes left in the range.
+    pub fn remaining(r: *const BodyReader) u64 {
+        return r.chain.range.end - r.pos;
+    }
+
+    /// Reads up to `dest.len` bytes of the range, never across a fragment
+    /// boundary. Returns 0 at the end of the range.
+    pub fn read(r: *BodyReader, dest: []u8) Error!usize {
+        if (r.pos >= r.chain.range.end or dest.len == 0) return 0;
+        while (r.frag < r.chain.fragments.len) {
+            const f = r.chain.fragments[r.frag];
+            if (r.pos >= f.body_start + f.data_len) {
+                r.frag += 1;
+                r.checked = false;
+                continue;
+            }
+            const off = f.offset orelse return error.Incomplete;
+            if (r.pos < f.body_start) return error.Incomplete; // a gap
+            const end = @min(f.body_start + f.data_len, r.chain.range.end);
+            const n: usize = @intCast(@min(dest.len, end - r.pos));
+            const within = r.pos - f.body_start;
+            if (f.in_head) {
+                const start = r.head.doc.prefixLen() + within;
+                @memcpy(dest[0..n], r.head.fragment[@intCast(start)..][0..n]);
+            } else {
+                const file = r.head.stripe.span.file;
+                const io = r.cache.io;
+                if (!r.checked) {
+                    const d = try doc_mod.readHeader(io, file, r.cache.config.hash_type, off);
+                    if (d.magic != fmt_doc.magic or !d.key.eql(&f.key) or d.dataLen() != f.data_len) return error.FragmentChanged;
+                    r.checked = true;
+                }
+                const at = off + f.doc.?.prefixLen() + within;
+                if (try file.readPositionalAll(io, dest[0..n], at) != n) return error.Truncated;
+            }
+            r.pos += n;
+            return n;
+        }
+        return error.Incomplete;
+    }
+};
+
+/// Writes the chain's range of the body. Returns the number of bytes
+/// written; less than the range's length when fragments are missing.
+pub fn writeBody(cache: *Cache, head: *const Head, c: Chain, w: *Io.Writer) !u64 {
+    var body: BodyReader = .init(cache, head, c);
+    var written: u64 = 0;
+    while (true) {
+        const dest = try w.writableSliceGreedy(1);
+        const n = body.read(dest) catch |err| switch (err) {
+            error.Incomplete => return written,
+            else => |e| return e,
+        };
+        if (n == 0) return written;
+        w.advance(n);
+        written += n;
+    }
 }
 
 test "byte ranges resolve as RFC 9110 says" {
