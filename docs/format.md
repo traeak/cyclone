@@ -339,15 +339,114 @@ so the fixed fields start at 48.
 - **Data fragments** are filed under their own `key`. Fragment 0 (the
   *earliest* fragment) is marked head too (`dir_set_head(!vc->fragment)`).
   Their `first_key` is still the object's key.
-- An **alternate** added later (Vary) gets its own Doc, filed under its own
-  earliest key, with that alternate's info in its header. The vector is then
-  rewritten under `first_key` with all alternates.
+- When an **alternate** is added (Vary), the vector is rewritten under
+  `first_key` with all alternates, carrying the new alternate's data if it
+  fits (its `key` is then that alternate's earliest key). The earlier
+  single-fragment Doc stays where it is, filed under its alternate's earliest
+  key, and still serves that alternate's data. Its header still holds the
+  old one-alternate vector.
+- All of an object's Docs live in the stripe its `first_key` picks, whatever
+  their own keys would pick (the read keeps the head's stripe). So a data
+  fragment can only be looked up in its head's stripe.
 
 So a lookup by a URL's key confirms a hit when the entry's Doc has
 `first_key == key`, which is what `CacheVC::openReadStartHead` checks; a
 mismatch is a tag collision and the probe goes on.
 
-In the fixture, there are 54 head entries for 49 URLs: 49 vectors (each
-filed under its URL's key), 3 earliest fragments of the 3 large objects, and
-2 second alternates of the 2 Vary objects (`tools/fixture/check.sh`, check
-5). Each 3 MB object is a 2.4 KB vector Doc plus 1 MiB data fragments.
+In the fixture, there are 56 head entries for 50 URLs: 50 vectors (each
+filed under its URL's key), 4 earliest fragments of the 4 multi-fragment
+objects, and the 2 original Docs of the 2 Vary objects
+(`tools/fixture/check.sh`, check 5). Each multi-fragment object is a 2.4 KB
+vector Doc plus 1 MiB data fragments.
+
+## Alternates (`HTTPInfo`)
+
+An HTTP head Doc's header (`hlen` bytes) is a `CacheHTTPInfoVector`: one
+marshalled alternate after another until the header ends
+(`CacheVC::unmarshal_http_info`). Each is a C++ struct copied byte for byte
+(x86-64), with pointers turned into offsets. The offsets below are checked
+against the compiled structs: `tools/ats-httpinfo/build.sh` writes
+`src/testdata/hdr_layout.txt`, and a unit test compares
+`src/format/http.zig` with it.
+
+```
+HTTPCacheAlt                 248 bytes (HTTP_ALT_MARSHAL_SIZE)
+fragment offset table        u64 × count, only if count > 4
+request HdrHeap              rounded up to 8
+response HdrHeap             rounded up to 8
+well-known-string identity   u64, only with magic MARSHALED_WKS
+```
+
+### `HTTPCacheAlt` (248 bytes, MD5 build)
+
+| off | type | field | notes |
+|---:|---|---|---|
+| 0 | u32 | `m_magic` | `0xdcbadeee` MARSHALED_WKS (24.3+), `0xdcbadeed` MARSHALED (older) |
+| 4 | i32 | `m_writeable` | 0 |
+| 12 | i32 | `m_id` | |
+| 16 | i32 | `m_rid` | |
+| 20 | key | `m_object_key` | the alternate's earliest key: its first data fragment |
+| 36 | i64 | `m_object_size` | as two i32 halves, low first |
+| 48 | ptr | `m_request_hdr.m_heap` | offset of the request heap from the alternate, 0 if none |
+| 112 | ptr | `m_response_hdr.m_heap` | same for the response |
+| 176 | i64 | `m_request_sent_time` | Unix seconds |
+| 184 | i64 | `m_response_received_time` | |
+| 192 | i32 | `m_frag_offset_count` | number of fragments − 1 |
+| 200 | ptr | `m_frag_offsets` | offset of the external table, used if count > 4 |
+| 208 | u64×4 | `m_integral_frag_offsets` | used if count ≤ 4 |
+
+Fragment offset *i* is the body offset where fragment *i+1* starts. In the
+fixture every fragment holds 1048504 bytes of data (1 MiB less the Doc).
+
+Before cache version 24.2 (`CACHE_DB_FRAG_OFFSET_TABLE_VERSION`), the external
+table held only the offsets past the first 4, and the first 4 stayed in the
+integral slots (`HTTPInfo::unmarshal_v24_1`). Those Docs also predate
+MARSHALED_WKS. The offsets for a FIPS build (32-byte keys) are not verified, so
+cyclone refuses to decode alternates with `--hash sha256`.
+
+The bytes each part takes are summed the way ATS does: 248, plus the
+external table, plus each heap rounded up to 8, plus the identity. The parts'
+positions come from their offsets.
+
+### `HdrHeap` (marshalled)
+
+| off | type | field | notes |
+|---:|---|---|---|
+| 0 | u32 | `m_magic` | `0xdcbafeed` MARSHALED |
+| 16 | ptr | `m_data_start` | 136, the end of this header |
+| 24 | u32 | `m_size` | end of the object area |
+| 28 | u8 | `m_writeable` | 0 |
+| 40 | u32 | `m_free_size` | 0 |
+| 64 | ptr | `m_ronly_heap[0].m_heap_start` | == `m_size`: the strings follow the objects |
+| 72 | i32 | `m_ronly_heap[0].m_heap_len` | |
+
+The heap is `m_size + m_heap_len` bytes. ATS checks it as above
+(`HdrHeap::check_marshalled`). Every pointer inside it, to an object or a
+string, is an offset from the heap's start. All strings are copied into the
+heap; well-known strings are stored as strings too, so decoding needs no
+token table. 24.3 objects carry the writer's table identity only so ATS can
+rebuild its well-known-string indexes.
+
+Objects follow each other from `m_data_start`, each starting with a u32
+`HdrHeapObjImpl`: type in bits 0–7 (1 raw, 2 URL, 3 HTTP header, 4 MIME
+header, 5 field block), length in bits 8–27. The first HTTP header object is
+the header.
+
+| object | field offsets |
+|---|---|
+| `HTTPHdrImpl` (48) | polarity i32 @4 (1 request, 2 response); version u8 major, u8 minor @8; request: URL ptr @16, method ptr @24, len u16 @32; response: reason ptr @16, len u16 @24, status i16 @26; fields (MIME header) ptr @40 |
+| `URLImpl` (112) | u16 lengths @4.. and pointers @24.. for scheme, user, password, host, port, path, params, query, fragment |
+| `MIMEHdrImpl` (592) | first field block inline @64 |
+| `MIMEFieldBlockImpl` (528) | freetop u32 @4; next block ptr @8; 16 slots of 32 bytes @16 |
+| `MIMEField` (32) | name ptr @0; value ptr @8; name len u16 @26; u32 @28: value len bits 0–23, readiness bits 28–29 (2 = live) |
+
+The fields of a header are the live slots below `freetop` in each block of
+the chain, in order. Deleted fields stay in their slots; ATS added `Via` to
+the stored request and then deleted it, so it is in the string heap but not
+in the header.
+
+Verified on the fixture: `tools/ats-httpinfo/build.sh ATS_SRC BUILD FIXTURE`
+decodes every head Doc with ATS's own `HTTPInfo::unmarshal`
+(`alts_golden.txt`), and check 6 of `tools/fixture/check.sh` compares all 54
+alternates field by field with `cyc-doc fragment`. That includes a 9-fragment
+object, whose 8 offsets need the external table.

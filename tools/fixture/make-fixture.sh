@@ -94,6 +94,7 @@ done
 requests() {
   for n in $(seq 1 40); do printf '/small/%s\t-\n' "$n"; done
   for n in 1 2 3; do printf '/large/%s\t-\n' "$n"; done
+  printf '/huge/1\t-\n'
   for n in 1 2; do
     for enc in gzip br identity; do printf '/vary/%s\t%s\n' "$n" "$enc"; done
   done

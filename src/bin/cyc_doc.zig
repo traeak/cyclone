@@ -10,6 +10,7 @@ const usage =
     \\usage: cyc-doc span   --span PATH... [--json]
     \\       cyc-doc stripe --span PATH... [--block SPAN:BLOCK] [--avg-obj-size [VOL=]N] [--json]
     \\       cyc-doc dir    --span PATH... [--block SPAN:BLOCK] [--segment N] [--entries [--docs]] [--json]
+    \\       cyc-doc fragment --span PATH... --at SPAN:OFFSET [--headers | --data] [--json]
     \\
     \\Read cached objects, and inspect the structures that hold them.
     \\
@@ -17,6 +18,7 @@ const usage =
     \\  span                show span headers and their stripe blocks
     \\  stripe              show stripe geometry and directory headers
     \\  dir                 directory statistics; with --entries, every entry in use
+    \\  fragment            one Doc: its header and, for an HTTP head, its alternates
     \\  (object reading: not implemented yet)
     \\
     \\options:
@@ -27,11 +29,15 @@ const usage =
     \\  --entries           dir: list entries in use (all of them, valid or not)
     \\  --docs              dir: with --entries, read each entry's Doc: its keys and
     \\                      lengths, and which key the entry is filed under
+    \\  --at S:OFFSET       fragment: the Doc at byte OFFSET of span S (as cyc-lookup
+    \\                      and `dir --entries` print offsets)
+    \\  --headers           fragment: print every stored request and response field
+    \\  --data              fragment: write the fragment's data bytes to stdout
     \\  --json              machine-readable output
     \\
 ;
 
-const Command = enum { span, stripe, dir };
+const Command = enum { span, stripe, dir, fragment };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -42,6 +48,7 @@ pub fn main(init: std.process.Init) !void {
     var command: ?Command = null;
     var only: ?[2]usize = null;
     var dir_opts: DirOptions = .{};
+    var frag_opts: FragmentOptions = .{};
 
     var it: cli.ArgIterator = .init(args);
     while (it.next()) |arg| {
@@ -57,6 +64,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--docs")) {
             dir_opts.entries = true;
             dir_opts.docs = true;
+        } else if (std.mem.eql(u8, arg, "--at")) {
+            const text = it.value(arg);
+            const colon = std.mem.indexOfScalar(u8, text, ':') orelse cli.fatal("--at wants SPAN:OFFSET, got '{s}'", .{text});
+            frag_opts.at = .{
+                std.fmt.parseInt(usize, text[0..colon], 10) catch cli.fatal("bad --at '{s}'", .{text}),
+                std.fmt.parseInt(u64, text[colon + 1 ..], 0) catch cli.fatal("bad --at '{s}'", .{text}),
+            };
+        } else if (std.mem.eql(u8, arg, "--headers")) {
+            frag_opts.headers = true;
+        } else if (std.mem.eql(u8, arg, "--data")) {
+            frag_opts.data = true;
         } else if (std.mem.eql(u8, arg, "--segment")) {
             const text = it.value(arg);
             dir_opts.segment = std.fmt.parseInt(u64, text, 10) catch cli.fatal("bad --segment '{s}'", .{text});
@@ -82,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
         .span => try spanCommand(init.gpa, init.io, arena, out, common.spans.items, json),
         .stripe => try stripeCommand(init.gpa, init.io, arena, out, &common, only, json),
         .dir => try dirCommand(init.gpa, init.io, arena, out, &common, only, dir_opts, json),
+        .fragment => try fragmentCommand(init.gpa, init.io, arena, out, &common, frag_opts, json),
     }
     try out.flush();
 }
@@ -534,7 +553,7 @@ fn dirReport(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, si: usize
 }
 
 fn entryDoc(io: Io, arena: std.mem.Allocator, stripe: *const cyclone.Stripe, hash_type: cyclone.HashType, segment: u64, bucket: u64, d: cyclone.dir.Dir) !DirReport.EntryDoc {
-    const doc = cyclone.doc.readHeader(io, stripe, hash_type, cyclone.dir.contentOffset(stripe, d)) catch |err|
+    const doc = cyclone.doc.readHeader(io, stripe.span.file, hash_type, cyclone.dir.contentOffset(stripe, d)) catch |err|
         return .{ .magic_ok = false, .read_error = @errorName(err) };
     if (doc.magic != cyclone.format.doc.magic) return .{ .magic_ok = false };
     const g = stripe.geometry;
@@ -607,6 +626,233 @@ fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
         });
     }
 }
+
+const FragmentOptions = struct {
+    at: ?struct { usize, u64 } = null,
+    headers: bool = false,
+    data: bool = false,
+};
+
+/// Fragments longer than this are not read (ATS's are at most a few MB).
+const max_fragment_len = 64 * 1024 * 1024;
+
+const FragmentReport = struct {
+    span_index: usize,
+    span: []const u8,
+    offset: u64,
+    /// The stripe whose content area holds the offset, as SPAN:BLOCK.
+    stripe: ?[]const u8,
+    doc: ?DocReport = null,
+    error_message: ?[]const u8 = null,
+    alternates: []const AltReport = &.{},
+
+    const DocReport = struct {
+        magic: u32,
+        len: u32,
+        total_len: u64,
+        hlen: u32,
+        data_len: u64,
+        first_key: []const u8,
+        key: []const u8,
+        doc_type: u8,
+        version: []const u8,
+        sync_serial: u32,
+        write_serial: u32,
+        pinned: u32,
+        checksum: u32,
+        /// "off" (DOC_NO_CHECKSUM), "ok", or "bad".
+        checksum_state: []const u8,
+        single_fragment: bool,
+    };
+
+    const AltReport = struct {
+        index: usize,
+        object_key: []const u8,
+        object_size: i64,
+        frag_offsets: []const u64,
+        request_sent_time: i64,
+        response_received_time: i64,
+        method: []const u8,
+        url: ?cyclone.format.http.Url,
+        request_version: []const u8,
+        status: i16,
+        reason: []const u8,
+        response_version: []const u8,
+        request_fields: []const cyclone.format.http.Field,
+        response_fields: []const cyclone.format.http.Field,
+        wks_identity: ?u64,
+    };
+};
+
+fn fragmentCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: *Io.Writer, common: *const cli.Common, opts: FragmentOptions, json: bool) !void {
+    const at = opts.at orelse cli.fatal("fragment needs --at SPAN:OFFSET", .{});
+    const spans = common.spans.items;
+    if (at[0] >= spans.len) cli.fatal("--at {d}:{d}: there are only {d} spans", .{ at[0], at[1], spans.len });
+    var span = try openSpan(gpa, io, out, spans[at[0]]);
+    defer span.close(gpa, io);
+
+    var r: FragmentReport = .{ .span_index = at[0], .span = span.path, .offset = at[1], .stripe = null };
+    for (span.blocks, 0..) |b, bi| {
+        if (!b.free and at[1] >= b.offset and at[1] < b.offset + b.byteLen())
+            r.stripe = try std.fmt.allocPrint(arena, "{d}:{d}", .{ at[0], bi });
+    }
+
+    const hash_type = common.hash_type;
+    const doc = cyclone.doc.readHeader(io, span.file, hash_type, at[1]) catch |err| {
+        r.error_message = @errorName(err);
+        return printFragmentReport(out, r, opts, json);
+    };
+    if (doc.magic != cyclone.format.doc.magic) {
+        r.error_message = try std.fmt.allocPrint(arena, "no Doc at this offset (magic 0x{x:0>8})", .{doc.magic});
+        return printFragmentReport(out, r, opts, json);
+    }
+    const frag = cyclone.doc.readFragment(arena, io, span.file, hash_type, at[1], max_fragment_len) catch |err| {
+        r.error_message = try std.fmt.allocPrint(arena, "cannot read the fragment ({s}, len {d})", .{ @errorName(err), doc.len });
+        return printFragmentReport(out, r, opts, json);
+    };
+
+    if (opts.data and !json) {
+        const start = @min(doc.prefixLen(), frag.len);
+        try out.writeAll(frag[start..]);
+        return;
+    }
+
+    r.doc = .{
+        .magic = doc.magic,
+        .len = doc.len,
+        .total_len = doc.total_len,
+        .hlen = doc.hlen,
+        .data_len = doc.dataLen(),
+        .first_key = try std.fmt.allocPrint(arena, "{f}", .{doc.first_key}),
+        .key = try std.fmt.allocPrint(arena, "{f}", .{doc.key}),
+        .doc_type = @backingInt(doc.doc_type),
+        .version = try std.fmt.allocPrint(arena, "{d}.{d}", .{ doc.v_major, doc.v_minor }),
+        .sync_serial = doc.sync_serial,
+        .write_serial = doc.write_serial,
+        .pinned = doc.pinned,
+        .checksum = doc.checksum,
+        .checksum_state = if (doc.checksum == cyclone.format.doc.no_checksum)
+            "off"
+        else if (cyclone.format.doc.checksum(hash_type, frag, true) == doc.checksum)
+            "ok"
+        else
+            "bad",
+        .single_fragment = doc.singleFragment(),
+    };
+
+    if (doc.doc_type == .http and doc.hlen > 0) {
+        if (cyclone.doc.alternates(arena, frag, doc)) |alts| {
+            const reports = try arena.alloc(FragmentReport.AltReport, alts.len);
+            for (alts, reports, 0..) |a, *ar, i| ar.* = try altReport(arena, a, i);
+            r.alternates = reports;
+        } else |err| {
+            r.error_message = try std.fmt.allocPrint(arena, "cannot decode the alternates: {s}", .{@errorName(err)});
+        }
+    }
+    try printFragmentReport(out, r, opts, json);
+}
+
+fn altReport(arena: std.mem.Allocator, a: cyclone.format.http.Alternate, index: usize) !FragmentReport.AltReport {
+    const req = a.request;
+    const resp = a.response;
+    return .{
+        .index = index,
+        .object_key = try std.fmt.allocPrint(arena, "{f}", .{a.object_key}),
+        .object_size = a.object_size,
+        .frag_offsets = a.frag_offsets,
+        .request_sent_time = a.request_sent_time,
+        .response_received_time = a.response_received_time,
+        .method = if (req) |h| h.method else "",
+        .url = if (req) |h| h.url else null,
+        .request_version = if (req) |h| try std.fmt.allocPrint(arena, "{d}.{d}", .{ h.version_major, h.version_minor }) else "",
+        .status = if (resp) |h| h.status else 0,
+        .reason = if (resp) |h| h.reason else "",
+        .response_version = if (resp) |h| try std.fmt.allocPrint(arena, "{d}.{d}", .{ h.version_major, h.version_minor }) else "",
+        .request_fields = if (req) |h| h.fields else &.{},
+        .response_fields = if (resp) |h| h.fields else &.{},
+        .wks_identity = a.wks_identity,
+    };
+}
+
+fn printFragmentReport(out: *Io.Writer, r: FragmentReport, opts: FragmentOptions, json: bool) !void {
+    if (json) {
+        try std.json.Stringify.value(r, .{ .whitespace = .indent_2 }, out);
+        try out.writeByte('\n');
+        return;
+    }
+    try out.print("fragment    span {d} offset {d}", .{ r.span_index, r.offset });
+    if (r.stripe) |st| try out.print(" (stripe {s})", .{st}) else try out.writeAll(" (not in any stripe)");
+    try out.writeByte('\n');
+    if (r.doc) |d| {
+        try out.print("length      {d} (Doc {d}, header {d}, data {d})\n", .{ d.len, d.len - d.hlen - d.data_len, d.hlen, d.data_len });
+        try out.print("object      {d} bytes{s}\n", .{ d.total_len, if (d.single_fragment) ", all in this fragment" else "" });
+        try out.print("first_key   {s}\nkey         {s}\n", .{ d.first_key, d.key });
+        try out.print("type        {s}  version {s}\n", .{ docTypeName(d.doc_type), d.version });
+        try out.print("serials     sync {d}  write {d}\n", .{ d.sync_serial, d.write_serial });
+        if (d.pinned != 0) try out.print("pinned      until {f}\n", .{Time{ .secs = d.pinned }});
+        if (std.mem.eql(u8, d.checksum_state, "off")) {
+            try out.writeAll("checksum    off\n");
+        } else {
+            try out.print("checksum    0x{x:0>8} ({s})\n", .{ d.checksum, d.checksum_state });
+        }
+    }
+    if (r.alternates.len != 0) try out.print("alternates  {d}\n", .{r.alternates.len});
+    for (r.alternates) |a| {
+        try out.print("\nalt {d}       {s} ", .{ a.index, a.method });
+        if (a.url) |u| try out.print("{f}", .{u});
+        try out.print("\n            {d} {s}, {d} bytes", .{ a.status, a.reason, a.object_size });
+        for (a.response_fields) |f| if (std.ascii.eqlIgnoreCase(f.name, "Content-Type")) {
+            try out.print(", {s}", .{f.value});
+            break;
+        };
+        try out.writeByte('\n');
+        for (a.response_fields) |f| if (std.ascii.eqlIgnoreCase(f.name, "Vary")) {
+            try out.print("            vary {s}\n", .{f.value});
+        };
+        try out.print("            object_key {s}, {d} fragment{s}", .{ a.object_key, a.frag_offsets.len + 1, if (a.frag_offsets.len == 0) "" else "s" });
+        if (a.frag_offsets.len != 0) {
+            try out.writeAll(" (starting at");
+            for (a.frag_offsets) |o| try out.print(" {d}", .{o});
+            try out.writeAll(")");
+        }
+        try out.print("\n            request sent {f}, response received {f}\n", .{ Time{ .secs = a.request_sent_time }, Time{ .secs = a.response_received_time } });
+        if (opts.headers) {
+            try out.print("            > {s} ", .{a.method});
+            if (a.url) |u| try out.print("{f}", .{u});
+            try out.print(" HTTP/{s}\n", .{a.request_version});
+            for (a.request_fields) |f| try out.print("            > {s}: {s}\n", .{ f.name, f.value });
+            try out.print("            < HTTP/{s} {d} {s}\n", .{ a.response_version, a.status, a.reason });
+            for (a.response_fields) |f| try out.print("            < {s}: {s}\n", .{ f.name, f.value });
+        }
+    }
+    if (r.error_message) |m| try out.print("error: {s}\n", .{m});
+}
+
+fn docTypeName(t: u8) []const u8 {
+    return switch (t) {
+        0 => "none",
+        2 => "rtsp",
+        3 => "http",
+        else => "unknown",
+    };
+}
+
+/// Seconds since the epoch, printed as UTC.
+const Time = struct {
+    secs: i64,
+
+    pub fn format(t: Time, w: *Io.Writer) Io.Writer.Error!void {
+        if (t.secs <= 0) return w.print("{d}", .{t.secs});
+        const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(t.secs) };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = es.getDaySeconds();
+        try w.print("{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            yd.year,              md.month.numeric(),      @as(u32, md.day_index) + 1,
+            ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        });
+    }
+};
 
 fn pct(a: u64, b: u64) f64 {
     if (b == 0) return 0;

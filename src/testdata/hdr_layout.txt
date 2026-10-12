@@ -1,0 +1,86 @@
+const sizeof(HTTPCacheAlt) 248
+const HTTP_ALT_MARSHAL_SIZE 248
+field HTTPCacheAlt.m_magic 0 4
+field HTTPCacheAlt.m_writeable 4 4
+field HTTPCacheAlt.m_unmarshal_len 8 4
+field HTTPCacheAlt.m_id 12 4
+field HTTPCacheAlt.m_rid 16 4
+field HTTPCacheAlt.m_object_key 20 16
+field HTTPCacheAlt.m_object_size 36 8
+field HTTPCacheAlt.m_request_hdr 48 64
+field HTTPCacheAlt.m_response_hdr 112 64
+field HTTPCacheAlt.m_request_sent_time 176 8
+field HTTPCacheAlt.m_response_received_time 184 8
+field HTTPCacheAlt.m_frag_offset_count 192 4
+field HTTPCacheAlt.m_frag_offsets 200 8
+field HTTPCacheAlt.m_integral_frag_offsets 208 32
+field HTTPHdr.m_heap 0 8
+const HTTPCacheAlt::N_INTEGRAL_FRAG_OFFSETS 4
+const sizeof(HdrHeap) 136
+const HDR_HEAP_HDR_SIZE 136
+field HdrHeap.m_magic 0 4
+field HdrHeap.m_free_start 8 8
+field HdrHeap.m_data_start 16 8
+field HdrHeap.m_size 24 4
+field HdrHeap.m_writeable 28 1
+field HdrHeap.m_next 32 8
+field HdrHeap.m_free_size 40 4
+field HdrHeap.m_ronly_heap 56 72
+const sizeof(StrHeapDesc) 24
+field StrHeapDesc.m_heap_start 8 8
+field StrHeapDesc.m_heap_len 16 4
+bits HdrHeapObjImpl.m_type 0 0 8
+bits HdrHeapObjImpl.m_length 0 8 20
+bits HdrHeapObjImpl.m_obj_flags 0 28 4
+const sizeof(HTTPHdrImpl) 48
+field HTTPHdrImpl.m_polarity 4 4
+field HTTPHdrImpl.m_version 8 2
+field HTTPHdrImpl.u.req.m_url_impl 16 8
+field HTTPHdrImpl.u.req.m_ptr_method 24 8
+field HTTPHdrImpl.u.req.m_len_method 32 2
+field HTTPHdrImpl.u.req.m_method_wks_idx 34 2
+field HTTPHdrImpl.u.resp.m_ptr_reason 16 8
+field HTTPHdrImpl.u.resp.m_len_reason 24 2
+field HTTPHdrImpl.u.resp.m_status 26 2
+field HTTPHdrImpl.m_fields_impl 40 8
+const sizeof(MIMEHdrImpl) 592
+field MIMEHdrImpl.m_fblock_list_tail 56 8
+field MIMEHdrImpl.m_first_fblock 64 528
+const sizeof(MIMEFieldBlockImpl) 528
+const MIME_FIELD_BLOCK_SLOTS 16
+field MIMEFieldBlockImpl.m_freetop 4 4
+field MIMEFieldBlockImpl.m_next 8 8
+field MIMEFieldBlockImpl.m_field_slots 16 512
+const sizeof(MIMEField) 32
+field MIMEField.m_ptr_name 0 8
+field MIMEField.m_ptr_value 8 8
+field MIMEField.m_next_dup 16 8
+field MIMEField.m_wks_idx 24 2
+field MIMEField.m_len_name 26 2
+bits MIMEField.m_len_value 28 0 24
+bits MIMEField.m_readiness 28 28 2
+bits MIMEField.m_flags 28 30 2
+const MIME_FIELD_SLOT_READINESS_LIVE 2
+const sizeof(URLImpl) 112
+field URLImpl.m_len_scheme 4 2
+field URLImpl.m_len_user 6 2
+field URLImpl.m_len_password 8 2
+field URLImpl.m_len_host 10 2
+field URLImpl.m_len_port 12 2
+field URLImpl.m_len_path 14 2
+field URLImpl.m_len_params 16 2
+field URLImpl.m_len_query 18 2
+field URLImpl.m_len_fragment 20 2
+field URLImpl.m_len_printed_string 22 2
+field URLImpl.m_ptr_scheme 24 8
+field URLImpl.m_ptr_user 32 8
+field URLImpl.m_ptr_password 40 8
+field URLImpl.m_ptr_host 48 8
+field URLImpl.m_ptr_port 56 8
+field URLImpl.m_ptr_path 64 8
+field URLImpl.m_ptr_params 72 8
+field URLImpl.m_ptr_query 80 8
+field URLImpl.m_ptr_fragment 88 8
+field URLImpl.m_ptr_printed_string 96 8
+field URLImpl.m_port 106 2
+field URLImpl.m_url_type 108 1

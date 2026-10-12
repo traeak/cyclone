@@ -6,6 +6,8 @@ body read back out of the cache can be checked against body_for().
 
   /small/N     a few bytes to ~20 KB, one fragment
   /large/N     3 MB and up, several fragments
+  /huge/N      9 MB and up, more fragments than fit in an alternate's
+               integral offset table (4)
   /vary/N      Vary: Accept-Encoding, one alternate per encoding asked for
   /query?...   same path, the query makes the key differ
 
@@ -25,6 +27,8 @@ def body_len(path):
         return (n * 1373) % 20000 + 1
     if kind == "large":
         return 3 * 1024 * 1024 + n * 4099
+    if kind == "huge":
+        return 9 * 1024 * 1024 + n * 4099
     return 1000 + n
 
 

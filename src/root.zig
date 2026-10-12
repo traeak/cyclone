@@ -17,6 +17,7 @@ pub const format = struct {
     pub const stripe = @import("format/stripe.zig");
     pub const dir = @import("format/dir.zig");
     pub const doc = @import("format/doc.zig");
+    pub const http = @import("format/http.zig");
 };
 
 pub const HashType = hash.HashType;

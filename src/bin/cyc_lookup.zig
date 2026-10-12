@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
     if (json) {
         try std.json.Stringify.value(results.items, .{ .whitespace = .indent_2 }, out);
         try out.writeByte('\n');
-    } else if (results.items.len == 1) {
+    } else if (results.items.len == 1 and !from_stdin) {
         try printDetail(out, results.items[0]);
     } else {
         for (results.items) |r| try printLine(out, r);
@@ -291,7 +291,7 @@ const Finder = struct {
                 .phase = d.phase(),
                 .valid = dir.entryValid(s, d),
             };
-            if (cyclone.doc.readHeader(f.io, s, f.common.hash_type, c.offset)) |doc| {
+            if (cyclone.doc.readHeader(f.io, s.span.file, f.common.hash_type, c.offset)) |doc| {
                 const v = cyclone.doc.check(doc, d, &key);
                 c.verdict = v;
                 if (v != .bad_magic) c.doc = try .init(f.arena, doc);

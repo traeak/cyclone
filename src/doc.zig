@@ -4,10 +4,10 @@
 const std = @import("std");
 const Io = std.Io;
 const fmt = @import("format/doc.zig");
+const http = @import("format/http.zig");
 const dir = @import("dir.zig");
 const hash = @import("hash.zig");
 const CacheKey = @import("key.zig").CacheKey;
-const Stripe = @import("stripe.zig").Stripe;
 
 pub const Doc = fmt.Doc;
 pub const FragType = fmt.FragType;
@@ -17,25 +17,36 @@ pub const FragType = fmt.FragType;
 pub const db_major = 24;
 pub const db_minor = 3;
 
-/// Reads the Doc at absolute span offset `offset`.
-pub fn readHeader(io: Io, stripe: *const Stripe, hash_type: hash.HashType, offset: u64) !Doc {
+/// Reads the Doc at byte `offset` of a span.
+pub fn readHeader(io: Io, file: Io.File, hash_type: hash.HashType, offset: u64) !Doc {
     var b: [fmt.max_header_len]u8 = undefined;
     const n = fmt.headerLen(hash_type);
-    if (try stripe.span.file.readPositionalAll(io, b[0..n], offset) != n) return error.Truncated;
+    if (try file.readPositionalAll(io, b[0..n], offset) != n) return error.Truncated;
     return Doc.decode(hash_type, b[0..n]);
 }
 
 /// Reads a whole fragment (`doc.len` bytes, Doc included) at `offset`.
 /// `limit` bounds the read; a Doc claiming more is `error.TooLong`.
-pub fn readFragment(gpa: std.mem.Allocator, io: Io, stripe: *const Stripe, hash_type: hash.HashType, offset: u64, limit: u64) ![]u8 {
-    const doc = try readHeader(io, stripe, hash_type, offset);
+pub fn readFragment(gpa: std.mem.Allocator, io: Io, file: Io.File, hash_type: hash.HashType, offset: u64, limit: u64) ![]u8 {
+    const doc = try readHeader(io, file, hash_type, offset);
     if (doc.magic != fmt.magic) return error.BadMagic;
     if (doc.len < fmt.headerLen(hash_type)) return error.TooShort;
     if (doc.len > limit) return error.TooLong;
     const buf = try gpa.alloc(u8, doc.len);
     errdefer gpa.free(buf);
-    if (try stripe.span.file.readPositionalAll(io, buf, offset) != buf.len) return error.Truncated;
+    if (try file.readPositionalAll(io, buf, offset) != buf.len) return error.Truncated;
     return buf;
+}
+
+/// The alternates in an HTTP fragment's header. `fragment` is the whole
+/// fragment as `readFragment` returns it; strings point into it. Allocates;
+/// pass an arena.
+pub fn alternates(arena: std.mem.Allocator, fragment: []const u8, doc: Doc) ![]http.Alternate {
+    if (doc.doc_type != .http) return error.NotHttp;
+    const start = fmt.headerLen(doc.first_key.hash_type);
+    if (doc.prefixLen() > fragment.len) return error.Truncated;
+    const hdr = fragment[start..][0..doc.hlen];
+    return http.decodeVector(arena, hdr, doc.first_key.hash_type, http.fullFragTable(doc.v_major, doc.v_minor));
 }
 
 /// What a Doc says about a directory entry and the key that led to it.

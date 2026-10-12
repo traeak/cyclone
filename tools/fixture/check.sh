@@ -79,4 +79,60 @@ print(len(vectors), "vectors,", sum(v != 1 for v in vectors.values()), "duplicat
 ' "$(echo "$urls" | "$bin/cyc-key" - | cut -f1)")
 check "head entries" "$(echo "$urls" | wc -l | tr -d ' ') vectors, 0 duplicated, 0 unexplained" "$got"
 
+# 6. Alternates, if tools/ats-httpinfo/build.sh has written ATS's own decoding
+#    of every head Doc (alts_golden.txt): cyc-doc fragment must agree on every
+#    field of every alternate.
+if [ -f "$fix/alts_golden.txt" ]; then
+  want=$(cat "$fix/alts_golden.txt")
+  got=$(grep '^doc ' "$fix/alts_golden.txt" | cut -d' ' -f2,3 | uniq | while read -r name off; do
+    case $name in span0.db) i=0 ;; span1.db) i=1 ;; esac
+    "$bin/cyc-doc" fragment $spans --at "$i:$off" --json
+  done | python3 -I -c '
+import json, sys
+
+def q(s):
+    out = []
+    for c in s:
+        o = ord(c)
+        if c in "\"\\":
+            out.append("\\" + c)
+        elif o < 0x20 or o >= 0x7f:
+            out.append("\\x%02x" % o)
+        else:
+            out.append(c)
+    return "\"" + "".join(out) + "\""
+
+dec = json.JSONDecoder()
+text = sys.stdin.read()
+pos = 0
+while pos < len(text.rstrip()):
+    while text[pos].isspace():
+        pos += 1
+    r, pos = dec.raw_decode(text, pos)
+    name = r["span"].rsplit("/", 1)[-1]
+    for a in r["alternates"]:
+        print("doc %s %d alt %d" % (name, r["offset"], a["index"]))
+        print("object_key %s  object_size %d  frags %d%s" % (a["object_key"].upper(), a["object_size"],
+              len(a["frag_offsets"]), "".join(" %d" % o for o in a["frag_offsets"])))
+        print("times %d %d" % (a["request_sent_time"], a["response_received_time"]))
+        u = a["url"] or {}
+        parts = [u.get(k, "") for k in ("scheme", "host", "port", "path", "params", "query", "fragment")]
+        print("request " + " ".join(q(p) for p in [a["method"]] + parts) + " " + a["request_version"])
+        for f in a["request_fields"]:
+            print("> %s %s" % (q(f["name"]), q(f["value"])))
+        print("response %d %s %s" % (a["status"], q(a["reason"]), a["response_version"]))
+        for f in a["response_fields"]:
+            print("< %s %s" % (q(f["name"]), q(f["value"])))
+')
+  if [ "$want" = "$got" ]; then
+    echo "ok    alternates ($(grep -c '^doc ' "$fix/alts_golden.txt") decoded as ATS does)"
+  else
+    echo "FAIL  alternates (diff: golden vs cyc-doc)"
+    echo "$got" | diff "$fix/alts_golden.txt" - | head -20
+    fail=1
+  fi
+else
+  echo "skip  alternates (no alts_golden.txt; see tools/ats-httpinfo/build.sh)"
+fi
+
 exit $fail
