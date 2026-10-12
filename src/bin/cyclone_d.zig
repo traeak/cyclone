@@ -19,6 +19,8 @@ const usage =
     \\  GET /v1/lookup/KEY        or ?url=U
     \\  GET /v1/object/KEY        or ?url=U    [&alt=N] [&range=SPEC]
     \\  GET /v1/body/KEY          or ?url=U    [&alt=N]    (Range, If-Range)
+    \\  GET /v1/stripes[/S:B]     [?stats=1]
+    \\  GET /v1/dir[/S:B]         [?segment=N] [&docs=1] [&heads=1] [&valid=1]   (JSON lines)
     \\
     \\KEY is a cache key in hex; U a cache-key URL, percent-encoded. Without alt,
     \\the alternate is chosen as ATS would for the request's own header fields.

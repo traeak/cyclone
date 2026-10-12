@@ -290,7 +290,7 @@ fn stripeCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: 
             if (only) |o| if (o[1] != bi) continue;
             var stripe = try cyclone.Stripe.open(gpa, io, &span, bi, common.avgObjSize(b.number));
             defer stripe.close(gpa);
-            try reports.append(arena, try .init(gpa, io, arena, si, &stripe));
+            try reports.append(arena, try cyclone.report.stripeReport(gpa, io, arena, si, &stripe));
         }
     }
 
@@ -305,79 +305,7 @@ fn stripeCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: 
     }
 }
 
-const StripeReport = struct {
-    span_index: usize,
-    block_index: usize,
-    span: []const u8,
-    volume: i32,
-    hash_text: []const u8,
-    offset: u64,
-    len: u64,
-    avg_obj_size: u32,
-    segments: u64,
-    buckets: u64,
-    entries: u64,
-    dir_len: u64,
-    copy_a: u64,
-    copy_b: u64,
-    content_start: u64,
-    content_len: u64,
-    copies: [2]CopyReport,
-    using: ?[]const u8,
-    header: ?cyclone.stripe.HeaderFooter,
-    freelist: []const u16,
-    issues: []const cyclone.span.Issue,
-    diagnosis: ?cyclone.stripe.Diagnosis,
-
-    const CopyReport = struct {
-        header: ?cyclone.stripe.HeaderFooter,
-        footer: ?cyclone.stripe.HeaderFooter,
-    };
-
-    fn init(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, span_index: usize, s: *const cyclone.Stripe) !StripeReport {
-        const g = s.geometry;
-        var hash_text: Io.Writer.Allocating = .init(arena);
-        try s.hashText(&hash_text.writer);
-        const issues = try s.check(arena);
-
-        // Only worth the scan when the footer is missing but header A is there.
-        var diagnosis: ?cyclone.stripe.Diagnosis = null;
-        if (!s.copies[0].magicOk() and !s.copies[1].magicOk()) {
-            if (try cyclone.stripe.diagnoseGeometry(gpa, io, s.span, s.block)) |d| {
-                defer gpa.free(d.candidates);
-                diagnosis = .{ .dir_len = d.dir_len, .candidates = try arena.dupe(cyclone.stripe.Candidate, d.candidates) };
-            }
-        }
-
-        return .{
-            .span_index = span_index,
-            .block_index = s.block_index,
-            .span = s.span.path,
-            .volume = s.block.number,
-            .hash_text = hash_text.written(),
-            .offset = s.block.offset,
-            .len = s.block.byteLen(),
-            .avg_obj_size = s.avg_obj_size,
-            .segments = g.segments,
-            .buckets = g.buckets,
-            .entries = g.entryCount(),
-            .dir_len = g.dirLen(),
-            .copy_a = g.copyOffset(.a),
-            .copy_b = g.copyOffset(.b),
-            .content_start = g.start,
-            .content_len = g.dataLen(),
-            .copies = .{
-                .{ .header = s.copies[0].header, .footer = s.copies[0].footer },
-                .{ .header = s.copies[1].header, .footer = s.copies[1].footer },
-            },
-            .using = if (s.chosen) |c| @tagName(c) else null,
-            .header = s.header(),
-            .freelist = try arena.dupe(u16, s.freelist),
-            .issues = issues,
-            .diagnosis = diagnosis,
-        };
-    }
-};
+const StripeReport = cyclone.report.StripeReport;
 
 fn printStripe(out: *Io.Writer, r: StripeReport) !void {
     const magic = cyclone.format.stripe.stripe_magic;
@@ -474,37 +402,7 @@ const DirReport = struct {
     buckets: u64,
     stats: ?cyclone.dir.Stats,
     error_message: ?[]const u8 = null,
-    entries: []const Entry,
-
-    const Entry = struct {
-        segment: u64,
-        bucket: u64,
-        index: u16,
-        offset: u64,
-        approx_size: u64,
-        tag: u12,
-        phase: u1,
-        head: bool,
-        pinned: bool,
-        valid: bool,
-        doc: ?EntryDoc = null,
-    };
-
-    const EntryDoc = struct {
-        /// Null when the bytes there are not a Doc.
-        magic_ok: bool,
-        len: u32 = 0,
-        hlen: u32 = 0,
-        total_len: u64 = 0,
-        doc_type: u8 = 0,
-        first_key: []const u8 = "",
-        key: []const u8 = "",
-        /// The Doc key whose segment, bucket and tag the entry is filed
-        /// under: "first_key" for a vector or single-fragment head, "key"
-        /// for a data fragment, null if neither (a stale or reused slot).
-        filed_under: ?[]const u8 = null,
-        read_error: ?[]const u8 = null,
-    };
+    entries: []const cyclone.report.DirEntry,
 };
 
 fn dirCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: *Io.Writer, common: *const cli.Common, only: ?[2]usize, opts: DirOptions, json: bool) !void {
@@ -569,7 +467,7 @@ fn dirReport(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, si: usize
         return r;
     };
 
-    var entries: std.ArrayList(DirReport.Entry) = .empty;
+    var entries: std.ArrayList(cyclone.report.DirEntry) = .empty;
     var stats: cyclone.dir.Stats = .{};
     for (0..stripe.geometry.segments) |s| {
         if (opts.segment) |want| if (want != s) continue;
@@ -582,53 +480,13 @@ fn dirReport(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, si: usize
             while (it.next()) |link| {
                 const d = link.dir;
                 if (d.isEmpty()) continue;
-                try entries.append(arena, .{
-                    .segment = s,
-                    .bucket = b,
-                    .index = link.index,
-                    .offset = cyclone.dir.contentOffset(stripe, d),
-                    .approx_size = d.approxSize(),
-                    .tag = d.tag(),
-                    .phase = d.phase(),
-                    .head = d.head(),
-                    .pinned = d.pinned(),
-                    .valid = cyclone.dir.entryValid(stripe, d),
-                    .doc = if (opts.docs) try entryDoc(io, arena, stripe, opts.hash_type, s, b, d) else null,
-                });
+                try entries.append(arena, try cyclone.report.dirEntry(io, stripe, opts.hash_type, si, s, b, link, opts.docs));
             }
         }
     }
     r.stats = stats;
     r.entries = entries.items;
     return r;
-}
-
-fn entryDoc(io: Io, arena: std.mem.Allocator, stripe: *const cyclone.Stripe, hash_type: cyclone.HashType, segment: u64, bucket: u64, d: cyclone.dir.Dir) !DirReport.EntryDoc {
-    const doc = cyclone.doc.readHeader(io, stripe.span.file, hash_type, cyclone.dir.contentOffset(stripe, d)) catch |err|
-        return .{ .magic_ok = false, .read_error = @errorName(err) };
-    if (doc.magic != cyclone.format.doc.magic) return .{ .magic_ok = false };
-    const g = stripe.geometry;
-    const filed = struct {
-        fn under(k: *const cyclone.CacheKey, gg: cyclone.stripe.Geometry, seg: u64, b: u64, tag: u12) bool {
-            const slot = cyclone.dir.Slot.of(k, gg.segments, gg.buckets);
-            return slot.segment == seg and slot.bucket == b and slot.tag == tag;
-        }
-    }.under;
-    return .{
-        .magic_ok = true,
-        .len = doc.len,
-        .hlen = doc.hlen,
-        .total_len = doc.total_len,
-        .doc_type = @backingInt(doc.doc_type),
-        .first_key = try std.fmt.allocPrint(arena, "{f}", .{doc.first_key}),
-        .key = try std.fmt.allocPrint(arena, "{f}", .{doc.key}),
-        .filed_under = if (filed(&doc.first_key, g, segment, bucket, d.tag()))
-            "first_key"
-        else if (filed(&doc.key, g, segment, bucket, d.tag()))
-            "key"
-        else
-            null,
-    };
 }
 
 fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
@@ -655,8 +513,8 @@ fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
             } else if (!doc.magic_ok) {
                 try out.writeAll("        no Doc (bad magic)\n");
             } else {
-                try out.print("        first_key {s}  key {s}  len {d} hlen {d} object {d}  {s}\n", .{
-                    doc.first_key,                                             doc.key, doc.len, doc.hlen, doc.total_len,
+                try out.print("        first_key {f}  key {f}  len {d} hlen {d} object {d}  {s}\n", .{
+                    doc.first_key.?,                                           doc.key.?, doc.len, doc.hlen, doc.total_len,
                     if (doc.filed_under) |f| f else "FILED UNDER NEITHER KEY",
                 });
             }

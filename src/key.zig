@@ -59,6 +59,11 @@ pub const CacheKey = struct {
         return k;
     }
 
+    /// In JSON, the key is its hex string.
+    pub fn jsonStringify(self: CacheKey, jw: anytype) !void {
+        try jw.print("\"{f}\"", .{self});
+    }
+
     /// Writes the key as lowercase hex digits.
     pub fn format(self: CacheKey, w: *std.Io.Writer) std.Io.Writer.Error!void {
         for (self.slice()) |b| try w.print("{x:0>2}", .{b});

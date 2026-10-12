@@ -258,7 +258,7 @@ for mode in "" --disk-directories; do
 label=${mode:+directories on disk}
 label=${label:-directories in memory}
 tmp=$(mktemp -d)
-"$bin/cyclone-d" $spans --unix "$tmp/sock" $mode 2> "$tmp/log" &
+"$bin/cyclone-d" $spans --unix "$tmp/sock" $mode > "$tmp/log" 2>&1 &
 daemon=$!
 for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
 got=$(python3 -I - "$bin" "$tmp/sock" "$fix/manifest.tsv" "$fix/select.tsv" $spans <<'PY'
@@ -271,6 +271,7 @@ class Conn:
     """A minimal HTTP/1.1 client: exactly the header fields given."""
     def __init__(self):
         self.s = socket.socket(socket.AF_UNIX)
+        self.s.settimeout(30)  # a protocol bug fails the check instead of hanging it
         self.s.connect(sock)
         self.buf = b""
     def _read_until(self, sep):
@@ -301,8 +302,18 @@ class Conn:
             if line:
                 k, _, v = line.partition(":")
                 hdrs[k.strip().lower()] = v.strip()
-        n = int(hdrs.get("content-length", "0"))
-        body = b"" if method == "HEAD" else self._read(n)
+        if method == "HEAD":
+            body = b""
+        elif hdrs.get("transfer-encoding") == "chunked":
+            body = b""
+            while True:
+                size = int(self._read_until(b"\r\n").split(b";")[0], 16)
+                body += self._read(size)
+                self._read_until(b"\r\n")
+                if size == 0:
+                    break
+        else:
+            body = self._read(int(hdrs.get("content-length", "0")))
         return status, hdrs, body
 
 def q(url):
@@ -367,11 +378,47 @@ for line in open(select_tsv).read().splitlines()[1:]:
     elif st != 404 or h.get("x-cyclone-cache") != "no-match":
         bad.append("%s [%s]: ATS had no match, cyclone-d %d %s" % (url, hdr, st, h.get("x-cyclone-cache")))
 
+# Stripes and directory scans, against cyc-doc stripe and dir.
+want_stripes = json.loads(subprocess.run([tool, "stripe", *spans, "--json"], capture_output=True, text=True).stdout)
+want_dirs = json.loads(subprocess.run([tool, "dir", *spans, "--entries", "--docs", "--json"], capture_output=True, text=True).stdout)
+st, h, b = c.get("/v1/stripes?stats=1")
+n += 1
+got = json.loads(b) if st == 200 else []
+if [{k: v for k, v in r.items() if k != "dir_stats"} for r in got] != [{k: v for k, v in r.items() if k != "dir_stats"} for r in want_stripes]:
+    bad.append("/v1/stripes differs from cyc-doc stripe --json")
+if [r.get("dir_stats") for r in got] != [d["stats"] for d in want_dirs]:
+    bad.append("/v1/stripes?stats=1 differs from cyc-doc dir --json stats")
+st, h, b = c.get("/v1/stripes/1:0")
+n += 1
+if st != 200 or json.loads(b)["block_index"] != 0 or json.loads(b)["span_index"] != 1:
+    bad.append("/v1/stripes/1:0: status %d" % st)
+want_entries = [e for d in want_dirs for e in d["entries"]]
+for qs, keep in [("?docs=1", lambda e: True), ("?docs=1&heads=1", lambda e: e["head"]),
+                ("?docs=1&valid=1", lambda e: e["valid"])]:
+    st, h, b = c.get("/v1/dir" + qs)
+    n += 1
+    lines = [json.loads(l) for l in b.decode().splitlines()]
+    if st != 200 or h.get("transfer-encoding") != "chunked" or lines != [e for e in want_entries if keep(e)]:
+        bad.append("/v1/dir%s differs from cyc-doc dir --entries --docs (%d lines, want %d)" % (qs, len(lines), len([e for e in want_entries if keep(e)])))
+for d in want_dirs:
+    st, h, b = c.get("/v1/dir/%d:%d?segment=0" % (d["span_index"], d["block_index"]))
+    n += 1
+    lines = [json.loads(l) for l in b.decode().splitlines()]
+    want = [{k: v for k, v in e.items() if k != "doc"} for e in d["entries"] if e["segment"] == 0]
+    if st != 200 or [{k: v for k, v in e.items() if k != "doc"} for e in lines] != want:
+        bad.append("/v1/dir/%d:%d?segment=0: %d lines, want %d" % (d["span_index"], d["block_index"], len(lines), len(want)))
+st, h, b = c.get("/v1/dir", method="HEAD")
+n += 1
+if st != 200 or b:
+    bad.append("HEAD /v1/dir: status %d" % st)
+
 # Errors.
 for target, method, want in [("/v1/body?url=" + q("http://127.0.0.1:18081/never"), "GET", 404),
                              ("/v1/body/zz", "GET", 400), ("/nope", "GET", 404),
                              ("/v1/body/00000000000000000000000000000000?alt=x", "GET", 400),
-                             ("/v1/object", "GET", 400)]:
+                             ("/v1/object", "GET", 400), ("/v1/stripes/9:9", "GET", 404),
+                             ("/v1/dir/0:0?segment=99", "GET", 404), ("/v1/dir?nope=1", "GET", 400),
+                             ("/v1/dir/x", "GET", 400)]:
     st, h, b = c.get(target, method=method)
     n += 1
     if st != want:

@@ -14,6 +14,10 @@ const http = @import("format/http.zig");
 const object = @import("object.zig");
 const select = @import("select.zig");
 const assign = @import("assign.zig");
+const dir = @import("dir.zig");
+const stripe_mod = @import("stripe.zig");
+const Stripe = stripe_mod.Stripe;
+const span_mod = @import("span.zig");
 
 pub const DocReport = struct {
     magic: u32,
@@ -418,4 +422,180 @@ pub fn lookup(arena: std.mem.Allocator, cache: *Cache, key: *const CacheKey, inp
     };
     r.candidates = candidates;
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// Stripes
+
+pub const StripeReport = struct {
+    span_index: usize,
+    block_index: usize,
+    span: []const u8,
+    volume: i32,
+    hash_text: []const u8,
+    offset: u64,
+    len: u64,
+    avg_obj_size: u32,
+    segments: u64,
+    buckets: u64,
+    entries: u64,
+    dir_len: u64,
+    copy_a: u64,
+    copy_b: u64,
+    content_start: u64,
+    content_len: u64,
+    copies: [2]CopyReport,
+    using: ?[]const u8,
+    header: ?stripe_mod.HeaderFooter,
+    freelist: []const u16,
+    issues: []const span_mod.Issue,
+    diagnosis: ?stripe_mod.Diagnosis,
+    /// Directory statistics, when asked for (a walk of every segment).
+    dir_stats: ?dir.Stats = null,
+
+    pub const CopyReport = struct {
+        header: ?stripe_mod.HeaderFooter,
+        footer: ?stripe_mod.HeaderFooter,
+    };
+};
+
+/// Headers, geometry and the copy in use of one stripe (`cyc-doc stripe`).
+pub fn stripeReport(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, span_index: usize, s: *const Stripe) !StripeReport {
+    const g = s.geometry;
+    var hash_text: Io.Writer.Allocating = .init(arena);
+    try s.hashText(&hash_text.writer);
+    const issues = try s.check(arena);
+
+    // Only worth the scan when the footer is missing but header A is there.
+    var diagnosis: ?stripe_mod.Diagnosis = null;
+    if (!s.copies[0].magicOk() and !s.copies[1].magicOk()) {
+        if (try stripe_mod.diagnoseGeometry(gpa, io, s.span, s.block)) |d| {
+            defer gpa.free(d.candidates);
+            diagnosis = .{ .dir_len = d.dir_len, .candidates = try arena.dupe(stripe_mod.Candidate, d.candidates) };
+        }
+    }
+
+    return .{
+        .span_index = span_index,
+        .block_index = s.block_index,
+        .span = s.span.path,
+        .volume = s.block.number,
+        .hash_text = hash_text.written(),
+        .offset = s.block.offset,
+        .len = s.block.byteLen(),
+        .avg_obj_size = s.avg_obj_size,
+        .segments = g.segments,
+        .buckets = g.buckets,
+        .entries = g.entryCount(),
+        .dir_len = g.dirLen(),
+        .copy_a = g.copyOffset(.a),
+        .copy_b = g.copyOffset(.b),
+        .content_start = g.start,
+        .content_len = g.dataLen(),
+        .copies = .{
+            .{ .header = s.copies[0].header, .footer = s.copies[0].footer },
+            .{ .header = s.copies[1].header, .footer = s.copies[1].footer },
+        },
+        .using = if (s.chosen) |c| @tagName(c) else null,
+        .header = s.header(),
+        .freelist = try arena.dupe(u16, s.freelist),
+        .issues = issues,
+        .diagnosis = diagnosis,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Directories
+
+/// One directory entry in use (`cyc-doc dir --entries`, `/v1/dir`).
+pub const DirEntry = struct {
+    span_index: usize,
+    block_index: usize,
+    segment: u64,
+    bucket: u64,
+    index: u16,
+    offset: u64,
+    approx_size: u64,
+    tag: u12,
+    phase: u1,
+    head: bool,
+    pinned: bool,
+    valid: bool,
+    doc: ?DirEntryDoc = null,
+};
+
+pub const DirEntryDoc = struct {
+    /// False when the bytes there are not a Doc.
+    magic_ok: bool,
+    len: u32 = 0,
+    hlen: u32 = 0,
+    total_len: u64 = 0,
+    doc_type: u8 = 0,
+    first_key: ?CacheKey = null,
+    key: ?CacheKey = null,
+    /// The Doc key whose segment, bucket and tag the entry is filed
+    /// under: "first_key" for a vector or single-fragment head, "key"
+    /// for a data fragment, null if neither (a stale or reused slot).
+    filed_under: ?[]const u8 = null,
+    read_error: ?[]const u8 = null,
+};
+
+/// The entry `link` of bucket `bucket` in segment `segment`; with `docs`,
+/// also the Doc it points at (one read). Allocates nothing.
+pub fn dirEntry(io: Io, s: *const Stripe, hash_type: hash.HashType, span_index: usize, segment: u64, bucket: u64, link: dir.Link, docs: bool) !DirEntry {
+    const d = link.dir;
+    return .{
+        .span_index = span_index,
+        .block_index = s.block_index,
+        .segment = segment,
+        .bucket = bucket,
+        .index = link.index,
+        .offset = dir.contentOffset(s, d),
+        .approx_size = d.approxSize(),
+        .tag = d.tag(),
+        .phase = d.phase(),
+        .head = d.head(),
+        .pinned = d.pinned(),
+        .valid = dir.entryValid(s, d),
+        .doc = if (docs) entryDoc(io, s, hash_type, segment, bucket, d) else null,
+    };
+}
+
+fn entryDoc(io: Io, s: *const Stripe, hash_type: hash.HashType, segment: u64, bucket: u64, d: dir.Dir) DirEntryDoc {
+    const doc = doc_mod.readHeader(io, s.span.file, hash_type, dir.contentOffset(s, d)) catch |err|
+        return .{ .magic_ok = false, .read_error = @errorName(err) };
+    if (doc.magic != fmt_doc.magic) return .{ .magic_ok = false };
+    const g = s.geometry;
+    const filed = struct {
+        fn under(k: *const CacheKey, gg: stripe_mod.Geometry, seg: u64, b: u64, tag: u12) bool {
+            const slot = dir.Slot.of(k, gg.segments, gg.buckets);
+            return slot.segment == seg and slot.bucket == b and slot.tag == tag;
+        }
+    }.under;
+    return .{
+        .magic_ok = true,
+        .len = doc.len,
+        .hlen = doc.hlen,
+        .total_len = doc.total_len,
+        .doc_type = @backingInt(doc.doc_type),
+        .first_key = doc.first_key,
+        .key = doc.key,
+        .filed_under = if (filed(&doc.first_key, g, segment, bucket, d.tag()))
+            "first_key"
+        else if (filed(&doc.key, g, segment, bucket, d.tag()))
+            "key"
+        else
+            null,
+    };
+}
+
+/// Walks every segment of `s` (from memory when loaded, else read into
+/// `buf`, `dir.Segment.byteLen(s)` bytes).
+pub fn dirStats(gpa: std.mem.Allocator, io: Io, s: *const Stripe, buf: []u8) !dir.Stats {
+    var stats: dir.Stats = .{};
+    for (0..s.geometry.segments) |i| {
+        const seg = try dir.Segment.get(io, s, i, buf);
+        stats.add(try dir.segmentStats(gpa, s, &seg));
+    }
+    return stats;
 }

@@ -11,6 +11,10 @@
 //!                                   &alt=N, &range=SPEC
 //!   /v1/body/KEY, ?url=U            the body, with the stored response header;
 //!                                   &alt=N; honours Range and If-Range
+//!   /v1/stripes, /v1/stripes/S:B    stripe headers and geometry (cyc-doc stripe
+//!                                   --json); &stats=1 adds directory statistics
+//!   /v1/dir, /v1/dir/S:B            directory entries in use, one JSON line each,
+//!                                   streamed; &segment=N &docs=1 &heads=1 &valid=1
 //!
 //! Without `alt`, the alternate is chosen as ATS would for this request's
 //! own header fields.
@@ -83,7 +87,7 @@ fn handle(svc: *service.Service, io: Io, arena: std.mem.Allocator, request: *std
         .bad => |why| resp = try plain(arena, 400, why),
     }
 
-    const len = resp.length();
+    const len = resp.length() orelse 0;
     try send(arena, request, resp, body_buffer, keep_alive);
     if (options.access_log) {
         const us = start.durationTo(Io.Clock.awake.now(io)).toMicroseconds();
@@ -99,6 +103,8 @@ const help =
     \\  GET /v1/lookup/KEY        or ?url=U
     \\  GET /v1/object/KEY        or ?url=U    [&alt=N] [&range=SPEC]
     \\  GET /v1/body/KEY          or ?url=U    [&alt=N]    (Range, If-Range)
+    \\  GET /v1/stripes[/S:B]     [?stats=1]
+    \\  GET /v1/dir[/S:B]         [?segment=N] [&docs=1] [&heads=1] [&valid=1]   (JSON lines)
     \\
     \\KEY is a cache key in hex; U a cache-key URL, percent-encoded. Without alt,
     \\the alternate is chosen as ATS would for this request's header fields.
@@ -117,6 +123,44 @@ fn route(arena: std.mem.Allocator, target: []const u8, request: *std.http.Server
     const q = std.mem.indexOfScalar(u8, target, '?');
     const path = target[0 .. q orelse target.len];
     const query = if (q) |i| target[i + 1 ..] else "";
+
+    const scans = [_]struct { []const u8, service.Op }{ .{ "/v1/stripes", .stripes }, .{ "/v1/dir", .dir } };
+    for (scans) |o| {
+        if (!std.mem.startsWith(u8, path, o[0])) continue;
+        const rest = path[o[0].len..];
+        var req: service.Request = .{ .op = o[1], .target = "" };
+        if (rest.len > 1 and rest[0] == '/') {
+            req.stripe = parseStripe(rest[1..]) orelse
+                return .{ .bad = try std.fmt.allocPrint(arena, "bad stripe '{s}': want SPAN:BLOCK, as /v1/stripes lists them\n", .{rest[1..]}) };
+        } else if (rest.len != 0) {
+            continue;
+        }
+        var params = std.mem.splitScalar(u8, query, '&');
+        while (params.next()) |p| {
+            if (p.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, p, '=') orelse p.len;
+            const name = p[0..eq];
+            const value = if (eq < p.len) p[eq + 1 ..] else "";
+            if (std.mem.eql(u8, name, "segment")) {
+                req.segment = std.fmt.parseInt(u64, value, 10) catch
+                    return .{ .bad = try std.fmt.allocPrint(arena, "bad segment '{s}'\n", .{value}) };
+                continue;
+            }
+            const flag = if (std.mem.eql(u8, name, "stats"))
+                &req.stats
+            else if (std.mem.eql(u8, name, "docs"))
+                &req.docs
+            else if (std.mem.eql(u8, name, "heads"))
+                &req.heads_only
+            else if (std.mem.eql(u8, name, "valid"))
+                &req.valid_only
+            else
+                return .{ .bad = try std.fmt.allocPrint(arena, "unknown parameter '{s}'\n", .{name}) };
+            flag.* = parseFlag(value) orelse
+                return .{ .bad = try std.fmt.allocPrint(arena, "bad {s} '{s}': want 1 or 0\n", .{ name, value }) };
+        }
+        return .{ .request = req };
+    }
 
     const ops = [_]struct { []const u8, service.Op }{
         .{ "/v1/key", .key },       .{ "/v1/lookup", .lookup },
@@ -156,6 +200,22 @@ fn route(arena: std.mem.Allocator, target: []const u8, request: *std.http.Server
         return .{ .request = req };
     }
     return .not_found;
+}
+
+/// SPAN:BLOCK, both 0-based.
+fn parseStripe(text: []const u8) ?[2]usize {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
+    return .{
+        std.fmt.parseInt(usize, text[0..colon], 10) catch return null,
+        std.fmt.parseInt(usize, text[colon + 1 ..], 10) catch return null,
+    };
+}
+
+/// A flag parameter: present without a value, 1 or true; or 0 or false.
+fn parseFlag(value: []const u8) ?bool {
+    if (value.len == 0 or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
+    return null;
 }
 
 /// Decodes `%XX`; leaves `+` alone, since cache-key URLs may contain it.
@@ -198,22 +258,26 @@ fn send(arena: std.mem.Allocator, request: *std.http.Server.Request, resp: servi
         .empty => try request.respond("", respond_options),
         .bytes => |b| try request.respond(b, respond_options),
         .stream => |body| {
+            // An unknown length goes chunked.
             var bw = try request.respondStreaming(body_buffer, .{
-                .content_length = body.remaining(),
+                .content_length = body.len,
                 .respond_options = respond_options,
             });
             if (bw.isEliding()) {
-                // HEAD: the writer counts the length off without sending,
-                // and nothing is read.
-                try bw.writer.splatByteAll(0, @intCast(body.remaining()));
+                // HEAD: the writer counts a known length off without
+                // sending, and nothing is read.
+                if (body.len) |len| try bw.writer.splatByteAll(0, @intCast(len));
             } else {
                 // Pull straight into the body writer's buffer.
-                while (body.remaining() != 0) {
+                var sent: u64 = 0;
+                while (true) {
                     const dest = try bw.writer.writableSliceGreedy(1);
                     const n = try body.read(dest);
-                    if (n == 0) return error.Truncated;
+                    if (n == 0) break;
                     bw.writer.advance(n);
+                    sent += n;
                 }
+                if (body.len) |len| if (sent != len) return error.Truncated;
             }
             try bw.end();
         },

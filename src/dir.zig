@@ -65,6 +65,28 @@ pub const Segment = struct {
         return .{ .index = s, .buckets = g.buckets, .freelist_head = stripe.freelist[s], .raw = raw };
     }
 
+    /// Bytes `get` needs in `buf` for a segment of this stripe.
+    pub fn byteLen(stripe: *const Stripe) usize {
+        return @intCast(stripe.geometry.buckets * fmt.depth * fmt.entry_len);
+    }
+
+    /// Segment `s` without allocating: a view of the directory in memory
+    /// when the stripe has it loaded, else read into `buf` (at least
+    /// `byteLen(stripe)` bytes, reused from one segment to the next). Not to be
+    /// passed to `deinit`.
+    pub fn get(io: Io, stripe: *const Stripe, s: u64, buf: []u8) !Segment {
+        const copy = stripe.chosen orelse return error.NoUsableDirectory;
+        const g = stripe.geometry;
+        if (s >= g.segments) return error.NoSuchSegment;
+        const n = byteLen(stripe);
+        const raw = if (stripe.entries) |mem| mem[@intCast(s * n)..][0..n] else blk: {
+            const b = buf[0..n];
+            if (try stripe.span.file.readPositionalAll(io, b, g.entriesOffset(copy) + s * n) != n) return error.Truncated;
+            break :blk b;
+        };
+        return .{ .index = s, .buckets = g.buckets, .freelist_head = stripe.freelist[s], .raw = raw };
+    }
+
     pub fn deinit(self: *Segment, gpa: std.mem.Allocator) void {
         gpa.free(self.raw);
         self.* = undefined;

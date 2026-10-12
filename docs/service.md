@@ -49,10 +49,22 @@ cache-key URL, percent-encoded (`+` is not a space).
 | `/v1/lookup/KEY`, `/v1/lookup?url=U` | the directory probe, as `cyc-lookup --json` |
 | `/v1/object/KEY`, `?url=U` | the object report, as `cyc-doc object --json`; `&alt=N`, `&range=SPEC` |
 | `/v1/body/KEY`, `?url=U` | the body; `&alt=N` |
+| `/v1/stripes`, `/v1/stripes/S:B` | stripe headers, geometry and the copy in use, as `cyc-doc stripe --json` (an array, or the one stripe); `&stats=1` adds `dir_stats`, as `cyc-doc dir` counts them |
+| `/v1/dir`, `/v1/dir/S:B` | directory entries in use, one JSON object per line (`application/x-ndjson`, chunked), as `cyc-doc dir --entries --json` lists them; `&segment=N`, `&docs=1` (read each entry's Doc), `&heads=1`, `&valid=1` |
 
 The JSON reports always answer 200 (a miss is in the report); a bad key or
-parameter is 400, an unknown path 404 (with this list), a method other than
-GET or HEAD 405.
+parameter is 400, an unknown path or a stripe or segment that does not exist
+404, a method other than GET or HEAD 405. S:B is a stripe as `/v1/stripes`
+lists it: span index and block index, both from 0.
+
+### Directory scans
+
+`/v1/dir` streams: each line is written as the scan reaches its entry, from
+the directory in memory (or a segment at a time from the span with
+`--disk-directories`), with nothing held per entry, so a scan of a large
+cache uses constant memory. Lines carry `span_index` and `block_index`, so a
+scan of every stripe can be told apart. With `docs=1` each entry costs one
+read of its Doc header, and says which key the entry is filed under.
 
 ### Choosing the alternate
 
@@ -96,6 +108,8 @@ reaches it, and if it no longer matches, the connection is closed mid-body.
 - `src/http_server.zig`: HTTP/1.1 on `std.http.Server`, keep-alive, HEAD
   without reading the body.
 - `src/report.zig`: the JSON reports, shared with `cyc-doc` and `cyc-lookup`.
+- Response bodies are a `service.Source` the transport pulls from: an
+  object's `BodyReader`, or the directory scan.
 - `src/bin/cyclone_d.zig`: options, listeners, one task per connection
   (`std.Io.Group.concurrent`) up to `--max-connections`.
 - `Stripe.loadDirectory` / `Cache.loadDirectories`: the directories in
@@ -108,7 +122,9 @@ window allows, without changing the service.
 Verified by `tools/fixture/check.sh` (check 10): every alternate's body and
 status, HEAD lengths, ranges with and without If-Range, 416, ignored multiple
 ranges, `object` and `lookup` JSON equal to the tools', selection by the
-request's own fields as live ATS served it (`select.tsv`), errors, and 32
+request's own fields as live ATS served it (`select.tsv`), `/v1/stripes`
+and `/v1/dir` against `cyc-doc stripe` and `cyc-doc dir --entries --docs`
+(with each filter and per segment), errors, and 32
 connections reading every large body at once; all over one keep-alive
 connection plus the 32. It runs twice, with directories in memory and with
 `--disk-directories`.
