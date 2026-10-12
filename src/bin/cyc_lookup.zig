@@ -17,8 +17,15 @@ const usage =
     \\bucket, and the entries whose tag matches. A 32-digit hex argument is a key
     \\(as cyc-key prints it); anything else is a cache-key URL.
     \\
-    \\Tag matches are candidates: 12 bits of the key, so a match must still be
-    \\confirmed against the full key in the Doc (not implemented yet).
+    \\Each entry whose 12-bit tag matches is checked against the full key in the
+    \\Doc it points at. A hit is a valid entry whose Doc has the key as its
+    \\first_key (or, for a data fragment's key, as its key).
+    \\
+    \\Batch output (several inputs, or -) is one line per input:
+    \\  KEY  STRIPE  hit|miss|stale  CANDIDATES  [URL]
+    \\where stale means only entries ATS would no longer trust match, and each
+    \\candidate is a byte offset, with h for a head entry, ! for a stale entry
+    \\and ? for one whose Doc does not confirm the key.
     \\
     \\options:
     \\
@@ -143,6 +150,55 @@ const Candidate = struct {
     pinned: bool,
     phase: u1,
     valid: bool,
+    verdict: ?cyclone.doc.Verdict = null,
+    /// Set when the Doc has the right magic.
+    doc: ?DocInfo = null,
+    read_error: ?[]const u8 = null,
+};
+
+/// The Doc fields worth showing for a lookup.
+const DocInfo = struct {
+    len: u32,
+    total_len: u64,
+    hlen: u32,
+    data_len: u64,
+    doc_type: []const u8,
+    version: []const u8,
+    first_key: []const u8,
+    key: []const u8,
+    pinned_until: u32,
+
+    fn init(arena: std.mem.Allocator, d: cyclone.doc.Doc) !DocInfo {
+        return .{
+            .len = d.len,
+            .total_len = d.total_len,
+            .hlen = d.hlen,
+            .data_len = d.dataLen(),
+            .doc_type = docTypeName(d.doc_type),
+            .version = try std.fmt.allocPrint(arena, "{d}.{d}", .{ d.v_major, d.v_minor }),
+            .first_key = try std.fmt.allocPrint(arena, "{f}", .{d.first_key}),
+            .key = try std.fmt.allocPrint(arena, "{f}", .{d.key}),
+            .pinned_until = d.pinned,
+        };
+    }
+};
+
+fn docTypeName(t: cyclone.doc.FragType) []const u8 {
+    return switch (t) {
+        .none => "none",
+        .unused_1 => "unused_1",
+        .rtsp => "rtsp",
+        .http => "http",
+        _ => "unknown",
+    };
+}
+
+const Status = enum {
+    /// A valid entry whose Doc confirms the key.
+    hit,
+    /// Only stale entries confirm the key.
+    stale,
+    miss,
 };
 
 const Result = struct {
@@ -159,6 +215,7 @@ const Result = struct {
     tag: u12 = 0,
     /// Entries walked in the bucket's chain.
     chain_length: u64 = 0,
+    status: Status = .miss,
     candidates: []const Candidate = &.{},
 };
 
@@ -225,7 +282,7 @@ const Finder = struct {
             r.chain_length += 1;
             const d = link.dir;
             if (d.isEmpty() or d.tag() != slot.tag) continue;
-            try candidates.append(f.arena, .{
+            var c: Candidate = .{
                 .index = link.index,
                 .offset = dir.contentOffset(s, d),
                 .approx_size = d.approxSize(),
@@ -233,7 +290,18 @@ const Finder = struct {
                 .pinned = d.pinned(),
                 .phase = d.phase(),
                 .valid = dir.entryValid(s, d),
-            });
+            };
+            if (cyclone.doc.readHeader(f.io, s, f.common.hash_type, c.offset)) |doc| {
+                const v = cyclone.doc.check(doc, d, &key);
+                c.verdict = v;
+                if (v != .bad_magic) c.doc = try .init(f.arena, doc);
+                if (v.found()) {
+                    if (c.valid) r.status = .hit else if (r.status == .miss) r.status = .stale;
+                }
+            } else |err| {
+                c.read_error = @errorName(err);
+            }
+            try candidates.append(f.arena, c);
         }
         if (chain.err) |e| r.error_message = switch (e) {
             .bad_next => "bucket chain has a next index past the segment",
@@ -268,13 +336,29 @@ fn printDetail(out: *Io.Writer, r: Result) !void {
     if (r.candidates.len == 0) {
         try out.writeAll("result      miss: no entry with this tag\n");
     } else {
+        try out.print("result      {s}\n", .{switch (r.status) {
+            .hit => "hit",
+            .stale => "stale: only entries ATS no longer trusts have this key",
+            .miss => "miss: no Doc confirms the key",
+        }});
         try out.print("candidates  {d}\n", .{r.candidates.len});
         for (r.candidates) |c| {
             try out.print("  offset {d}  ~{Bi:.1}  index {d}  phase {d}{s}{s}{s}\n", .{
-                c.offset,                         c.approx_size, c.index, c.phase,
-                if (c.head) "  head" else "",     if (c.pinned) "  pinned" else "",
-                if (c.valid) "" else "  STALE",
+                c.offset,                     c.approx_size,                    c.index,                        c.phase,
+                if (c.head) "  head" else "", if (c.pinned) "  pinned" else "", if (c.valid) "" else "  STALE",
             });
+            if (c.read_error) |e| {
+                try out.print("    read error: {s}\n", .{e});
+                continue;
+            }
+            const v = c.verdict orelse continue;
+            try out.print("    {s}\n", .{v.describe()});
+            const d = c.doc orelse continue;
+            try out.print("    doc {s} v{s}  len {d} (header {d}, data {d})  object {d}\n", .{
+                d.doc_type, d.version, d.len, d.hlen, d.data_len, d.total_len,
+            });
+            try out.print("    first_key {s}\n    key       {s}\n", .{ d.first_key, d.key });
+            if (d.pinned_until != 0) try out.print("    pinned until {d}\n", .{d.pinned_until});
         }
     }
     if (r.error_message) |m| try out.print("error: {s}\n", .{m});
@@ -285,12 +369,16 @@ fn printLine(out: *Io.Writer, r: Result) !void {
         try out.print("-\t-\terror: {s}\t{s}\n", .{ r.error_message.?, r.input });
         return;
     };
-    try out.print("{s}\t{d}:{d}\t", .{ key, r.span_index, r.block_index });
+    try out.print("{s}\t{d}:{d}\t{t}\t", .{ key, r.span_index, r.block_index, r.status });
     if (r.candidates.len == 0) {
-        try out.writeAll("miss");
+        try out.writeByte('-');
     } else for (r.candidates, 0..) |c, i| {
         if (i != 0) try out.writeByte(',');
-        try out.print("{d}{s}{s}", .{ c.offset, if (c.head) "h" else "", if (c.valid) "" else "!" });
+        const confirmed = if (c.verdict) |v| v.found() else false;
+        try out.print("{d}{s}{s}{s}", .{
+            c.offset,                 if (c.head) "h" else "",
+            if (c.valid) "" else "!", if (confirmed) "" else "?",
+        });
     }
     if (r.error_message) |m| try out.print(" (error: {s})", .{m});
     if (!std.mem.eql(u8, r.input, key)) try out.print("\t{s}", .{r.input});

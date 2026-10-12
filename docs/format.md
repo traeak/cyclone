@@ -288,3 +288,66 @@ Verified against the fixture (`tools/fixture/check.sh`): ATS logged
 `cyc-lookup --table` reproduces it. All 49 URLs resolve to exactly one valid
 head entry. With the wrong span seed, 20–28 of the 49 resolve to the wrong
 stripe and miss, so `--seed` must match what ATS hashed.
+
+## Doc (fragment header)
+
+Every fragment in a stripe's content area starts with a `Doc`
+(`src/iocore/cache/P_CacheDoc.h`), then `hlen` bytes of header, then data:
+`len` bytes in all. The directory entry's approximate size is `len` rounded
+up (`Stripe::round_to_approx_size`), so `len <= dir_approx_size`.
+
+### Layout (72 bytes; 104 in FIPS builds)
+
+| off | type | field | notes |
+|---:|---|---|---|
+| 0 | u32 | `magic` | `0x5F129B13` (`DOC_CORRUPT` `0xDEADBABE` is set in memory on a failed read) |
+| 4 | u32 | `len` | this fragment, Doc included, unrounded |
+| 8 | u64 | `total_len` | object length (see below) |
+| 16 | key | `first_key` | the object's key; for HTTP the cache key of the URL |
+| 32 | key | `key` | this fragment's key |
+| 48 | u32 | `hlen` | header bytes after the Doc |
+| 52 | u8 | `doc_type` | `CacheFragType`: 3 = HTTP |
+| 53 | u8 | `v_major` | `CACHE_DB_MAJOR_VERSION` (24) |
+| 54 | u8 | `v_minor` | `CACHE_DB_MINOR_VERSION` (3) |
+| 55 | u8 | `unused` | 0 |
+| 56 | u32 | `sync_serial` | |
+| 60 | u32 | `write_serial` | |
+| 64 | u32 | `pinned` | pinned-until time, 0 if not pinned |
+| 68 | u32 | `checksum` | `DOC_NO_CHECKSUM` `0xA0B0C0D0` unless `proxy.config.cache.enable_checksum` |
+
+Keys are `CryptoHash`: 16 bytes with MD5. In FIPS builds they are 32 bytes
+(SHA-256), `first_key` stays at 16, and `key` moves to the end (offset 72),
+so the fixed fields start at 48.
+
+- `data_len = len - sizeof(Doc) - hlen` (0 if negative).
+- The checksum is the sum, as C `char`, of the bytes from the end of the Doc
+  to `len`: signed on x86, unsigned on ARM.
+- A Doc newer than the running cache version is treated as corrupt
+  (`CacheVC::handleReadDone`).
+- The aggregator writes a *sync marker* when it flushes with nothing queued:
+  a Doc with zero keys, no header or data, and `len` of one approximate unit.
+
+### Which key an entry is filed under
+
+`init_document` / `update_document_key` in `StripeSM.cc`:
+
+- The **first write of an object** (`use_first_key`) is filed under
+  `first_key`, marked head. For HTTP it carries the alternate vector in its
+  header (`hlen > 0`). If the object fits, its data rides along and
+  `data_len == total_len` (a *single-fragment* object). Its `key` is
+  derived from the earliest key (`prev_CacheKey`), or random if it has no data.
+- **Data fragments** are filed under their own `key`. Fragment 0 (the
+  *earliest* fragment) is marked head too (`dir_set_head(!vc->fragment)`).
+  Their `first_key` is still the object's key.
+- An **alternate** added later (Vary) gets its own Doc, filed under its own
+  earliest key, with that alternate's info in its header. The vector is then
+  rewritten under `first_key` with all alternates.
+
+So a lookup by a URL's key confirms a hit when the entry's Doc has
+`first_key == key`, which is what `CacheVC::openReadStartHead` checks; a
+mismatch is a tag collision and the probe goes on.
+
+In the fixture, there are 54 head entries for 49 URLs: 49 vectors (each
+filed under its URL's key), 3 earliest fragments of the 3 large objects, and
+2 second alternates of the 2 Vary objects (`tools/fixture/check.sh`, check
+5). Each 3 MB object is a 2.4 KB vector Doc plus 1 MiB data fragments.

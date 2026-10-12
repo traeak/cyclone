@@ -49,10 +49,34 @@ for r in json.load(sys.stdin):
     print(r["index"], r["requested"], r["got"])')
 check "stripe assignment table" "$want" "$got"
 
-# 4. Every cached URL: exactly one tag match, a valid head entry.
+# 4. Every cached URL is a hit: one tag match, a valid head entry, and its
+#    Doc's first_key is the URL's key.
 got=$(echo "$urls" | "$bin/cyc-lookup" $spans - | awk -F'\t' '
-  $3 ~ /^[0-9]+h$/ { ok++; next } { bad++; print "  " $0 > "/dev/stderr" }
+  $3 == "hit" && $4 ~ /^[0-9]+h$/ { ok++; next } { bad++; print "  " $0 > "/dev/stderr" }
   END { printf "%d found, %d not", ok, bad }')
 check "lookups" "$(echo "$urls" | wc -l | tr -d ' ') found, 0 not" "$got"
+
+# 5. Every head entry belongs to a cached URL: filed under its Doc's
+#    first_key (a URL's vector) or under its own key (the first data fragment
+#    of a multi-fragment object, or an alternate's own Doc), and each URL key
+#    has exactly one vector.
+got=$("$bin/cyc-doc" dir $spans --docs --json | python3 -I -c '
+import json, sys
+keys = set(sys.argv[1].split())
+vectors, other, bad = {}, 0, 0
+for s in json.load(sys.stdin):
+    for e in s["entries"]:
+        d = e["doc"]
+        if not e["head"]:
+            continue
+        if d["first_key"] not in keys or d["filed_under"] is None:
+            bad += 1
+        elif d["filed_under"] == "first_key":
+            vectors[d["first_key"]] = vectors.get(d["first_key"], 0) + 1
+        else:
+            other += 1
+print(len(vectors), "vectors,", sum(v != 1 for v in vectors.values()), "duplicated,", bad, "unexplained")
+' "$(echo "$urls" | "$bin/cyc-key" - | cut -f1)")
+check "head entries" "$(echo "$urls" | wc -l | tr -d ' ') vectors, 0 duplicated, 0 unexplained" "$got"
 
 exit $fail

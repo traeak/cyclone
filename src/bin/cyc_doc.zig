@@ -9,7 +9,7 @@ const Span = cyclone.Span;
 const usage =
     \\usage: cyc-doc span   --span PATH... [--json]
     \\       cyc-doc stripe --span PATH... [--block SPAN:BLOCK] [--avg-obj-size [VOL=]N] [--json]
-    \\       cyc-doc dir    --span PATH... [--block SPAN:BLOCK] [--segment N] [--entries] [--json]
+    \\       cyc-doc dir    --span PATH... [--block SPAN:BLOCK] [--segment N] [--entries [--docs]] [--json]
     \\
     \\Read cached objects, and inspect the structures that hold them.
     \\
@@ -25,6 +25,8 @@ const usage =
     \\  --block S:B         only stripe block B of span S (both 0-based, as `span` lists them)
     \\  --segment N         dir: only directory segment N
     \\  --entries           dir: list entries in use (all of them, valid or not)
+    \\  --docs              dir: with --entries, read each entry's Doc: its keys and
+    \\                      lengths, and which key the entry is filed under
     \\  --json              machine-readable output
     \\
 ;
@@ -52,6 +54,9 @@ pub fn main(init: std.process.Init) !void {
             json = true;
         } else if (std.mem.eql(u8, arg, "--entries")) {
             dir_opts.entries = true;
+        } else if (std.mem.eql(u8, arg, "--docs")) {
+            dir_opts.entries = true;
+            dir_opts.docs = true;
         } else if (std.mem.eql(u8, arg, "--segment")) {
             const text = it.value(arg);
             dir_opts.segment = std.fmt.parseInt(u64, text, 10) catch cli.fatal("bad --segment '{s}'", .{text});
@@ -387,6 +392,8 @@ fn printDiagnosis(out: *Io.Writer, r: StripeReport, d: cyclone.stripe.Diagnosis)
 const DirOptions = struct {
     segment: ?u64 = null,
     entries: bool = false,
+    docs: bool = false,
+    hash_type: cyclone.HashType = .default,
 };
 
 const DirReport = struct {
@@ -410,6 +417,23 @@ const DirReport = struct {
         head: bool,
         pinned: bool,
         valid: bool,
+        doc: ?EntryDoc = null,
+    };
+
+    const EntryDoc = struct {
+        /// Null when the bytes there are not a Doc.
+        magic_ok: bool,
+        len: u32 = 0,
+        hlen: u32 = 0,
+        total_len: u64 = 0,
+        doc_type: u8 = 0,
+        first_key: []const u8 = "",
+        key: []const u8 = "",
+        /// The Doc key whose segment, bucket and tag the entry is filed
+        /// under: "first_key" for a vector or single-fragment head, "key"
+        /// for a data fragment, null if neither (a stale or reused slot).
+        filed_under: ?[]const u8 = null,
+        read_error: ?[]const u8 = null,
     };
 };
 
@@ -430,7 +454,9 @@ fn dirCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: *Io
             if (only) |o| if (o[1] != bi) continue;
             var stripe = try cyclone.Stripe.open(gpa, io, &span, bi, common.avgObjSize(b.number));
             defer stripe.close(gpa);
-            try reports.append(arena, try dirReport(gpa, io, arena, si, &stripe, opts));
+            var o = opts;
+            o.hash_type = common.hash_type;
+            try reports.append(arena, try dirReport(gpa, io, arena, si, &stripe, o));
         }
     }
 
@@ -497,6 +523,7 @@ fn dirReport(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, si: usize
                     .head = d.head(),
                     .pinned = d.pinned(),
                     .valid = cyclone.dir.entryValid(stripe, d),
+                    .doc = if (opts.docs) try entryDoc(io, arena, stripe, opts.hash_type, s, b, d) else null,
                 });
             }
         }
@@ -504,6 +531,34 @@ fn dirReport(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, si: usize
     r.stats = stats;
     r.entries = entries.items;
     return r;
+}
+
+fn entryDoc(io: Io, arena: std.mem.Allocator, stripe: *const cyclone.Stripe, hash_type: cyclone.HashType, segment: u64, bucket: u64, d: cyclone.dir.Dir) !DirReport.EntryDoc {
+    const doc = cyclone.doc.readHeader(io, stripe, hash_type, cyclone.dir.contentOffset(stripe, d)) catch |err|
+        return .{ .magic_ok = false, .read_error = @errorName(err) };
+    if (doc.magic != cyclone.format.doc.magic) return .{ .magic_ok = false };
+    const g = stripe.geometry;
+    const filed = struct {
+        fn under(k: *const cyclone.CacheKey, gg: cyclone.stripe.Geometry, seg: u64, b: u64, tag: u12) bool {
+            const slot = cyclone.dir.Slot.of(k, gg.segments, gg.buckets);
+            return slot.segment == seg and slot.bucket == b and slot.tag == tag;
+        }
+    }.under;
+    return .{
+        .magic_ok = true,
+        .len = doc.len,
+        .hlen = doc.hlen,
+        .total_len = doc.total_len,
+        .doc_type = @backingInt(doc.doc_type),
+        .first_key = try std.fmt.allocPrint(arena, "{f}", .{doc.first_key}),
+        .key = try std.fmt.allocPrint(arena, "{f}", .{doc.key}),
+        .filed_under = if (filed(&doc.first_key, g, segment, bucket, d.tag()))
+            "first_key"
+        else if (filed(&doc.key, g, segment, bucket, d.tag()))
+            "key"
+        else
+            null,
+    };
 }
 
 fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
@@ -521,10 +576,20 @@ fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
             var size_buf: [32]u8 = undefined;
             const size = std.fmt.bufPrint(&size_buf, "{Bi:.1}", .{e.approx_size}) catch "?";
             try out.print("  {d: >4} {d: >6} {d: >6}  {d: >14}  {s: >10}  0x{x:0>3}  phase {d}{s}{s}{s}\n", .{
-                e.segment,                       e.bucket,                     e.index, e.offset, size, e.tag, e.phase,
-                if (e.head) " head" else "",     if (e.pinned) " pinned" else "",
-                if (e.valid) "" else " STALE",
+                e.segment,                   e.bucket,                        e.index,                       e.offset, size, e.tag, e.phase,
+                if (e.head) " head" else "", if (e.pinned) " pinned" else "", if (e.valid) "" else " STALE",
             });
+            const doc = e.doc orelse continue;
+            if (doc.read_error) |m| {
+                try out.print("        read error: {s}\n", .{m});
+            } else if (!doc.magic_ok) {
+                try out.writeAll("        no Doc (bad magic)\n");
+            } else {
+                try out.print("        first_key {s}  key {s}  len {d} hlen {d} object {d}  {s}\n", .{
+                    doc.first_key,                                             doc.key, doc.len, doc.hlen, doc.total_len,
+                    if (doc.filed_under) |f| f else "FILED UNDER NEITHER KEY",
+                });
+            }
         }
         return;
     }
