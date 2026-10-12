@@ -15,6 +15,7 @@ const Stripe = @import("stripe.zig").Stripe;
 const cache_mod = @import("cache.zig");
 const Cache = cache_mod.Cache;
 const doc_mod = @import("doc.zig");
+const fmt_doc = @import("format/doc.zig");
 const Doc = doc_mod.Doc;
 const http = @import("format/http.zig");
 
@@ -74,8 +75,13 @@ pub const Chain = struct {
     /// Index of the alternate, or null for a non-HTTP object.
     alternate: ?usize,
     object_size: u64,
+    /// The bytes asked for; the whole object without a range.
+    range: ByteRange,
+    /// The fragments walked: all of them for the whole object, or those
+    /// holding the range.
     fragments: []const Fragment,
-    /// Body bytes the fragments found cover, from the start.
+    /// Body offset up to which the fragments found hold data, without a
+    /// gap, from the first fragment walked.
     covered: u64,
     /// Everything there and consistent: what ATS would serve.
     complete: bool,
@@ -83,8 +89,67 @@ pub const Chain = struct {
     problems: []const []const u8,
 };
 
-/// Finds the fragments of alternate `alt` (ignored for a non-HTTP object).
-pub fn chain(arena: std.mem.Allocator, cache: *Cache, head: *const Head, alt: usize) !Chain {
+/// Body bytes `[start, end)`.
+pub const ByteRange = struct {
+    start: u64,
+    end: u64,
+
+    pub fn len(r: ByteRange) u64 {
+        return r.end - r.start;
+    }
+};
+
+/// One HTTP byte range (RFC 9110 14.1.1), before the object size is known.
+pub const RangeSpec = union(enum) {
+    /// `first-last` (last inclusive), or `first-` (last null).
+    span: struct { first: u64, last: ?u64 },
+    /// `-n`: the last n bytes.
+    suffix: u64,
+
+    /// Parses `[bytes=]first-[last]` or `[bytes=]-suffix`. Only one range.
+    pub fn parse(text: []const u8) error{BadRange}!RangeSpec {
+        var t = std.mem.trim(u8, text, " \t");
+        if (std.ascii.startsWithIgnoreCase(t, "bytes=")) t = std.mem.trim(u8, t["bytes=".len..], " \t");
+        const dash = std.mem.indexOfScalar(u8, t, '-') orelse return error.BadRange;
+        const a = std.mem.trim(u8, t[0..dash], " \t");
+        const b = std.mem.trim(u8, t[dash + 1 ..], " \t");
+        if (a.len == 0) return .{ .suffix = try number(b) };
+        const first = try number(a);
+        if (b.len == 0) return .{ .span = .{ .first = first, .last = null } };
+        const last = try number(b);
+        if (last < first) return error.BadRange;
+        return .{ .span = .{ .first = first, .last = last } };
+    }
+
+    fn number(s: []const u8) error{BadRange}!u64 {
+        if (s.len == 0) return error.BadRange;
+        for (s) |c| if (!std.ascii.isDigit(c)) return error.BadRange;
+        return std.fmt.parseInt(u64, s, 10) catch error.BadRange;
+    }
+
+    /// The bytes of an object of `size` the range selects; null when it is
+    /// unsatisfiable (416).
+    pub fn resolve(spec: RangeSpec, size: u64) ?ByteRange {
+        switch (spec) {
+            .span => |r| {
+                if (r.first >= size) return null;
+                const last = if (r.last) |l| @min(l, size - 1) else size - 1;
+                return .{ .start = r.first, .end = last + 1 };
+            },
+            .suffix => |n| {
+                if (n == 0 or size == 0) return null;
+                return .{ .start = size - @min(n, size), .end = size };
+            },
+        }
+    }
+};
+
+/// Finds the fragments of alternate `alt` (ignored for a non-HTTP object)
+/// that hold `range`, or all of them for a null range. With a range it
+/// starts at the fragment the alternate's offset table puts the first byte
+/// in, as ATS does for a seek (`CacheVC::openReadMain`), and stops once
+/// the last byte is covered.
+pub fn chain(arena: std.mem.Allocator, cache: *Cache, head: *const Head, alt: usize, range: ?RangeSpec) !Chain {
     var problems: std.ArrayList([]const u8) = .empty;
     var frags: std.ArrayList(Fragment) = .empty;
 
@@ -111,6 +176,7 @@ pub fn chain(arena: std.mem.Allocator, cache: *Cache, head: *const Head, alt: us
         size = head.doc.total_len;
         key = head.doc.key;
     }
+    const want: ByteRange = if (range) |r| r.resolve(size) orelse return error.Unsatisfiable else .{ .start = 0, .end = size };
 
     var covered: u64 = 0;
     if (key.eql(&head.doc.key)) {
@@ -128,9 +194,14 @@ pub fn chain(arena: std.mem.Allocator, cache: *Cache, head: *const Head, alt: us
         });
         covered = n;
         if (n != size) try problems.append(arena, try std.fmt.allocPrint(arena, "the head Doc holds {d} data bytes, not the object size {d}", .{ n, size }));
-    } else if (size != 0) {
+    } else if (want.len() != 0) {
+        // The fragment holding the first byte: one past the last table
+        // entry at or before it.
         var i: usize = 0;
-        while (covered < size) : (i += 1) {
+        while (i < frag_offsets.len and frag_offsets[i] <= want.start) i += 1;
+        if (i > 0) covered = frag_offsets[i - 1];
+        for (0..i) |_| key = key.next();
+        while (covered < want.end) : (i += 1) {
             if (i == max_fragments) {
                 try problems.append(arena, "over a million fragments; giving up");
                 break;
@@ -166,39 +237,71 @@ pub fn chain(arena: std.mem.Allocator, cache: *Cache, head: *const Head, alt: us
         }
     }
     if (covered > size) try problems.append(arena, try std.fmt.allocPrint(arena, "the fragments hold {d} bytes, more than the object size {d}", .{ covered, size }));
-    if (covered == size and frags.items.len > 1 and frags.items.len - 1 != frag_offsets.len and alternate != null)
-        try problems.append(arena, try std.fmt.allocPrint(arena, "{d} fragments, but the alternate lists {d} fragment offsets", .{ frags.items.len, frag_offsets.len }));
+    if (covered == size and alternate != null and frags.items.len != 0) {
+        const last = frags.items[frags.items.len - 1].index;
+        if (last != frag_offsets.len)
+            try problems.append(arena, try std.fmt.allocPrint(arena, "{d} fragments, but the alternate lists {d} fragment offsets", .{ last + 1, frag_offsets.len }));
+    }
 
     return .{
         .alternate = alternate,
         .object_size = size,
+        .range = want,
         .fragments = frags.items,
         .covered = covered,
-        .complete = covered == size and problems.items.len == 0,
+        .complete = covered >= want.end and problems.items.len == 0,
         .problems = problems.items,
     };
 }
 
-/// Writes the body bytes the chain's fragments hold, in order, up to the
-/// object size. Returns the number written; less than `object_size` when
-/// fragments are missing.
-pub fn writeBody(gpa: std.mem.Allocator, cache: *Cache, head: *const Head, c: Chain, w: *Io.Writer) !u64 {
+/// Writes the chain's range of the body, reading only the bytes needed
+/// from each fragment. Returns the number written; less than the range's
+/// length when fragments are missing.
+pub fn writeBody(cache: *Cache, head: *const Head, c: Chain, w: *Io.Writer) !u64 {
     var written: u64 = 0;
+    var buf: [64 * 1024]u8 = undefined;
     for (c.fragments) |f| {
         const off = f.offset orelse break;
-        const want = @min(f.data_len, c.object_size - written);
+        // This fragment's share of the range.
+        const lo = @max(f.body_start, c.range.start + written);
+        const hi = @min(f.body_start + f.data_len, c.range.end);
+        if (lo >= hi) continue;
+        if (lo != c.range.start + written) break; // a gap
         if (f.in_head) {
-            const start = head.doc.prefixLen();
-            try w.writeAll(head.fragment[start..][0..want]);
+            const start = head.doc.prefixLen() + (lo - f.body_start);
+            try w.writeAll(head.fragment[start..][0..@intCast(hi - lo)]);
         } else {
-            const frag = try doc_mod.readFragment(gpa, cache.io, head.stripe.span.file, cache.config.hash_type, off, @min(f.approx_size, max_fragment_len));
-            defer gpa.free(frag);
-            const d = Doc.decode(cache.config.hash_type, frag);
-            if (!d.key.eql(&f.key)) return error.FragmentChanged;
-            try w.writeAll(frag[d.prefixLen()..][0..want]);
+            const d = try doc_mod.readHeader(cache.io, head.stripe.span.file, cache.config.hash_type, off);
+            if (d.magic != fmt_doc.magic or !d.key.eql(&f.key) or d.dataLen() != f.data_len) return error.FragmentChanged;
+            var at = off + d.prefixLen() + (lo - f.body_start);
+            var left = hi - lo;
+            while (left != 0) {
+                const n: usize = @intCast(@min(left, buf.len));
+                if (try head.stripe.span.file.readPositionalAll(cache.io, buf[0..n], at) != n) return error.Truncated;
+                try w.writeAll(buf[0..n]);
+                at += n;
+                left -= n;
+            }
         }
-        written += want;
-        if (written == c.object_size) break;
+        written += hi - lo;
+        if (written == c.range.len()) break;
     }
     return written;
+}
+
+test "byte ranges resolve as RFC 9110 says" {
+    const t = std.testing;
+    const size = 1000;
+    try t.expectEqual(ByteRange{ .start = 0, .end = 500 }, (try RangeSpec.parse("bytes=0-499")).resolve(size).?);
+    try t.expectEqual(ByteRange{ .start = 500, .end = 1000 }, (try RangeSpec.parse("500-")).resolve(size).?);
+    try t.expectEqual(ByteRange{ .start = 900, .end = 1000 }, (try RangeSpec.parse("-100")).resolve(size).?);
+    try t.expectEqual(ByteRange{ .start = 0, .end = 1000 }, (try RangeSpec.parse("-5000")).resolve(size).?);
+    try t.expectEqual(ByteRange{ .start = 990, .end = 1000 }, (try RangeSpec.parse("990-5000")).resolve(size).?);
+    try t.expectEqual(@as(?ByteRange, null), (try RangeSpec.parse("1000-")).resolve(size));
+    try t.expectEqual(@as(?ByteRange, null), (try RangeSpec.parse("-0")).resolve(size));
+    try t.expectEqual(@as(?ByteRange, null), (try RangeSpec.parse("0-")).resolve(0));
+    try t.expectError(error.BadRange, RangeSpec.parse("5-4"));
+    try t.expectError(error.BadRange, RangeSpec.parse("1-2,5-6"));
+    try t.expectError(error.BadRange, RangeSpec.parse("x-"));
+    try t.expectError(error.BadRange, RangeSpec.parse("-"));
 }

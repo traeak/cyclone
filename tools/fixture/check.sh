@@ -172,4 +172,81 @@ PY
 check "whole objects ($(echo "$got" | cut -f2) alternates, bodies match the origin)" \
   "$(echo "$urls" | wc -l | tr -d ' ') URLs, 0 problems" "$(echo "$got" | cut -f1)"
 
+# 8. Ranges: for every alternate, ranges at and around each fragment
+#    boundary, suffixes and open ends give the same bytes as slicing the
+#    whole body, and read only the fragments the offset table says hold them.
+got=$(python3 -I - "$bin/cyc-doc" "$fix/manifest.tsv" $spans <<'PY'
+import json, subprocess, sys
+tool, manifest, spans = sys.argv[1], sys.argv[2], sys.argv[3:]
+urls = sorted({l.split("\t")[0] for l in open(manifest).read().splitlines()[1:]})
+bad = []
+n = 0
+for url in urls:
+    r = json.loads(subprocess.run([tool, "object", *spans, url, "--json"], capture_output=True, text=True).stdout)
+    for alt in r["alternates"]:
+        i, size, offs = alt["index"], alt["object_size"], alt["frag_offsets"]
+        whole = subprocess.run([tool, "object", *spans, url, "--alt", str(i), "--body"], capture_output=True).stdout
+        starts = [0] + offs
+        specs = {"0-0", "-1", "0-", "-%d" % (size + 5), "%d-" % (size - 1), "%d-%d" % (size // 3, 2 * size // 3)}
+        for b in offs:
+            specs |= {"%d-%d" % (b - 1, b), "%d-" % b, "%d-%d" % (b, b), "-%d" % (size - b), "%d-%d" % (b - 1, b - 1)}
+        for spec in sorted(specs):
+            n += 1
+            first, _, last = spec.partition("-")
+            if first == "":
+                lo, hi = size - min(int(last), size), size
+            else:
+                lo, hi = int(first), min(int(last), size - 1) + 1 if last else size
+            p = subprocess.run([tool, "object", *spans, url, "--alt", str(i), "--range", spec, "--body"], capture_output=True)
+            if p.returncode != 0 or p.stdout != whole[lo:hi]:
+                bad.append("%s alt %d range %s: wrong bytes (%s)" % (url, i, spec, p.stderr.decode().strip()))
+                continue
+            j = json.loads(subprocess.run([tool, "object", *spans, url, "--alt", str(i), "--range", spec, "--json"], capture_output=True, text=True).stdout)
+            want = [k for k, st in enumerate(starts) if st < hi and (k + 1 == len(starts) or starts[k + 1] > lo)]
+            if [f["index"] for f in j["fragments"]] != want:
+                bad.append("%s alt %d range %s: read fragments %s, want %s" % (url, i, spec, [f["index"] for f in j["fragments"]], want))
+        p = subprocess.run([tool, "object", *spans, url, "--alt", str(i), "--range", "%d-" % size, "--body"], capture_output=True)
+        if p.returncode != 1 or b"not satisfiable" not in p.stderr:
+            bad.append("%s alt %d: range past the end is not refused" % (url, i))
+for b in bad:
+    print("  " + b, file=sys.stderr)
+print("%d problems\t%d" % (len(bad), n))
+PY
+)
+check "ranges ($(echo "$got" | cut -f2) ranges, bytes and fragments read)" "0 problems" "$(echo "$got" | cut -f1)"
+
+# 9. Alternate selection: for each request in select.tsv, the alternate
+#    `cyc-doc object --select` picks has the body ATS served from the cache,
+#    and where ATS had nothing to serve (504), nothing is picked.
+if [ -f "$fix/select.tsv" ]; then
+  got=$(python3 -I - "$bin/cyc-doc" "$fix/select.tsv" $spans <<'PY'
+import hashlib, subprocess, sys
+tool, table, spans = sys.argv[1], sys.argv[2], sys.argv[3:]
+bad = []
+rows = [l.split("\t") for l in open(table).read().splitlines()[1:]]
+for url, hdr, status, length, sha in rows:
+    # The request curl sent (make-fixture.sh fetch), less Host and User-Agent.
+    if hdr == "-":
+        fields = ["Accept: */*"]
+    elif hdr.startswith("Accept:"):
+        fields = [hdr]
+    else:
+        fields = ["Accept: */*", hdr]
+    args = [a for f in fields for a in ("--req-header", f)]
+    p = subprocess.run([tool, "object", *spans, url, *args, "--body"], capture_output=True)
+    if status == "200":
+        if p.returncode != 0 or hashlib.sha256(p.stdout).hexdigest() != sha:
+            bad.append("%s [%s]: ATS served %s, cyclone %s" % (url, hdr, sha[:12], p.stderr.decode().strip() or hashlib.sha256(p.stdout).hexdigest()[:12]))
+    elif p.returncode != 1 or b"no alternate matches" not in p.stderr:
+        bad.append("%s [%s]: ATS had no match (%s), cyclone picked one" % (url, hdr, status))
+for b in bad:
+    print("  " + b, file=sys.stderr)
+print("%d problems\t%d" % (len(bad), len(rows)))
+PY
+)
+  check "alternate selection ($(echo "$got" | cut -f2) requests, as ATS served them)" "0 problems" "$(echo "$got" | cut -f1)"
+else
+  echo "skip  alternate selection (no $fix/select.tsv; rerun make-fixture.sh)"
+fi
+
 exit $fail

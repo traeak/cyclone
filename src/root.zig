@@ -14,6 +14,7 @@ pub const assign = @import("assign.zig");
 pub const doc = @import("doc.zig");
 pub const cache = @import("cache.zig");
 pub const object = @import("object.zig");
+pub const select = @import("select.zig");
 pub const format = struct {
     pub const span = @import("format/span.zig");
     pub const stripe = @import("format/stripe.zig");

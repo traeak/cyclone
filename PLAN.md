@@ -112,7 +112,8 @@ A port of `url_CryptoHash_get_general`: it lowercases and unescapes scheme and h
 
 ### `cyc-doc` — read a whole object
 ```
-cyc-doc object   --span cache.db KEY|URL [--alt N] [--headers | --body > out.bin] [--json]
+cyc-doc object   --span cache.db KEY|URL [--alt N | --select [--req-header 'NAME: VALUE']...]
+                 [--range SPEC] [--headers | --body > out.bin] [--json]
 cyc-doc fragment --span cache.db --at SPAN:OFFSET [--headers | --data] [--json]   # one Doc, by location
 ```
 - Default output: object summary, the list of alternates (request URL, status, content type, size, Vary), and fragment chain health.
@@ -143,7 +144,7 @@ A daemon (`cyclone-d`) that opens the spans once, keeps stripe headers and direc
 
 - ~~Is the hash type stored on disk?~~ **No.** `CryptoContext::Setting` is fixed at build time (`src/tscore/CryptoHash.cc:33-37`: MD5, or SHA-256 when `TS_ENABLE_FIPS`), and there is no runtime config. Neither `DiskHeader`, `StripeHeaderFooter` nor `Doc` records it, and the stripe version number is the same for both. Hence the default of MD5 plus `--hash`. Optional later: a `--check-hash` sanity probe that reads a few head Docs and checks that `len`/`hlen`/`first_key`↔dir-tag are consistent under the chosen layout (non-FIPS `Doc` header = 72 bytes, FIPS = 104), and warns on a mismatch.
 - How exactly is the stripe `hash_id` seeded: which path string, and what to do when it is a device symlink? This decides whether a `--as` override is needed.
-- How should `cyc-doc` pick an alternate by default: index 0, or matching on request headers given with `--req-header`? Start with the index and add matching later.
+- ~~How should `cyc-doc` pick an alternate by default?~~ Index 0 (`--alt N`); `--select` with `--req-header` matches as ATS does.
 
 ## Immediate next steps
 
@@ -158,4 +159,5 @@ A daemon (`cyclone-d`) that opens the spans once, keeps stripe headers and direc
 4. ~~Lookup~~ done.
 5. ~~HTTPInfo decoding~~ done: `src/format/http.zig` decodes the alternate vector (alternates, both heaps, URL, fields, fragment offset table, both table formats). Layout offsets are checked against ATS's compiled structs (`tools/ats-httpinfo`, `src/testdata/hdr_layout.txt`), and every fixture alternate matches ATS's own `HTTPInfo::unmarshal` (check 6). `cyc-doc fragment --at S:OFFSET [--headers|--data]` shows one Doc. Not verified: the FIPS layout (refused), and pre-24.2 Docs (no sample).
 6. ~~Whole objects~~ done: `src/cache.zig` (spans + assignment table + stripes + probe, shared by the tools and later the service), `src/object.zig` (head, alternates, fragment chain, body). `cyc-doc object KEY|URL [--alt N] [--headers | --body] [--json]` reports each fragment and any inconsistency, and `--body` streams the body (exit 1 if incomplete). `cyc-lookup --stripe S:B` finds a data-fragment key in its object's stripe. Check 7 compares every alternate's body with what the origin sent.
-7. Next: Phase 3, the service. Decide the protocol (HTTP/1.1 over UDS/TCP first), then expose lookup, object info and bodies over the transport-independent `Cache` API. Open before that: alternate selection by request headers (`--req-header`), and range reads using the fragment offset table.
+7. ~~Alternate selection and range reads~~ done: `src/select.zig` ports `SelectFromAlternates` (quality from Accept, Accept-Charset, Accept-Encoding, Accept-Language; Vary; age tie-break; Accept-Encoding normalization), checked against ATS's own functions on 808 generated cases (`tools/ats-httpinfo/selectq.cc`, `src/testdata/select_golden.txt`) and against what the live ATS served for 29 requests (check 9). `cyc-doc object --select [--req-header ...] [--record NAME=VALUE]`. Range reads (`--range`) seek with the fragment offset table as ATS does and read only the fragments needed (check 8).
+8. Next: Phase 3, the service. Decide the protocol (HTTP/1.1 over UDS/TCP first), then expose lookup, object info and bodies (with selection and ranges) over the transport-independent `Cache` API.

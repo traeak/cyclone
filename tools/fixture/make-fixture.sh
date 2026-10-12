@@ -6,8 +6,12 @@
 # ATS_PREFIX is an installed ATS master (bin/traffic_server, bin/traffic_layout).
 # OUT_DIR gets:
 #   spans/span0.db, spans/span1.db   the cache (span1 uses hash_seed "seed-span1")
-#   manifest.tsv                     what was cached: cache-key URL, Accept-Encoding,
-#                                    body length, body sha256
+#   manifest.tsv                     what was cached: cache-key URL, the request
+#                                    header that selects the variant, body length,
+#                                    body sha256
+#   select.tsv                       what ATS then served from the cache (only-if-cached)
+#                                    for each URL and request header: status, body
+#                                    length, body sha256
 #   cachekeys.txt                    the exact strings ATS hashed (debug tag url_cachekey)
 #   runroot/                         the ATS sandbox, with logs
 #
@@ -90,25 +94,64 @@ for _ in $(seq 100); do
   sleep 0.2
 done
 
-# path<TAB>Accept-Encoding ("-" for none)
+# path<TAB>request header ("-" for none)
 requests() {
   for n in $(seq 1 40); do printf '/small/%s\t-\n' "$n"; done
   for n in 1 2 3; do printf '/large/%s\t-\n' "$n"; done
   printf '/huge/1\t-\n'
   for n in 1 2; do
-    for enc in gzip br identity; do printf '/vary/%s\t%s\n' "$n" "$enc"; done
+    for enc in gzip br identity; do printf '/vary/%s\tAccept-Encoding: %s\n' "$n" "$enc"; done
   done
+  printf '/lang/1\t%s\n' 'Accept-Language: en' 'Accept-Language: de' -
   for q in 'a=1' 'a=2' 'a=1&b=2' 'b=2&a=1'; do printf '/query?%s\t-\n' "$q"; done
 }
 
-printf 'url\taccept_encoding\tlength\tsha256\n' > "$out/manifest.tsv"
-requests | while IFS="$(printf '\t')" read -r path enc; do
-  set -- -s -H "Host: origin.test"
-  [ "$enc" = - ] || set -- "$@" -H "Accept-Encoding: $enc"
-  curl "$@" -o "$out/body.tmp" "http://127.0.0.1:$proxy_port$path"
+# Lookups after the cache is filled: path<TAB>request header. With
+# only-if-cached ATS answers from the cache or with 504, and writes nothing.
+lookups() {
+  for h in - 'Accept-Encoding: gzip' 'Accept-Encoding: GZIP' 'Accept-Encoding: x-gzip' \
+    'Accept-Encoding: br' 'Accept-Encoding: identity' 'Accept-Encoding: gzip, br' \
+    'Accept-Encoding: br, gzip;q=0' 'Accept-Encoding: gzip;q=0' 'Accept-Encoding: deflate' \
+    'Accept-Encoding: *' 'Accept-Encoding: identity;q=0, gzip' 'Accept: text/html' \
+    'Accept: application/*;q=0.5' 'Accept-Language: en'; do
+    printf '/vary/1\t%s\n' "$h"
+  done
+  for h in - 'Accept-Language: en' 'Accept-Language: de' 'Accept-Language: EN' \
+    'Accept-Language: en-US' 'Accept-Language: en, de' 'Accept-Language: fr' \
+    'Accept-Language: *' 'Accept-Language: de;q=0.5' 'Accept-Encoding: gzip'; do
+    printf '/lang/1\t%s\n' "$h"
+  done
+  for h in - 'Accept: image/png' 'Accept-Encoding: br' 'Accept-Language: fr'; do
+    printf '/small/1\t%s\n' "$h"
+  done
+}
+
+# fetch PATH HEADER [CURL_ARGS...]: sets status, len and sum. The request
+# has Accept: */* (curl's default) unless HEADER is an Accept.
+fetch() {
+  path=$1 hdr=$2
+  shift 2
+  set -- -s -H "Host: origin.test" "$@"
+  case $hdr in
+    -) ;;
+    Accept:*) set -- "$@" -H "$hdr" ;;
+    *) set -- "$@" -H "Accept: */*" -H "$hdr" ;;
+  esac
+  status=$(curl "$@" -o "$out/body.tmp" -w '%{http_code}' "http://127.0.0.1:$proxy_port$path")
   len=$(wc -c < "$out/body.tmp")
   sum=$(sha256sum "$out/body.tmp" | cut -d' ' -f1)
-  printf 'http://127.0.0.1:%s%s\t%s\t%s\t%s\n' "$origin_port" "$path" "$enc" "$len" "$sum" >> "$out/manifest.tsv"
+}
+
+printf 'url\trequest_header\tlength\tsha256\n' > "$out/manifest.tsv"
+requests | while IFS="$(printf '\t')" read -r path hdr; do
+  fetch "$path" "$hdr"
+  printf 'http://127.0.0.1:%s%s\t%s\t%s\t%s\n' "$origin_port" "$path" "$hdr" "$len" "$sum" >> "$out/manifest.tsv"
+done
+
+printf 'url\trequest_header\tstatus\tlength\tsha256\n' > "$out/select.tsv"
+lookups | while IFS="$(printf '\t')" read -r path hdr; do
+  fetch "$path" "$hdr" -H "Cache-Control: only-if-cached"
+  printf 'http://127.0.0.1:%s%s\t%s\t%s\t%s\t%s\n' "$origin_port" "$path" "$hdr" "$status" "$len" "$sum" >> "$out/select.tsv"
 done
 rm -f "$out/body.tmp"
 

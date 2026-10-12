@@ -23,6 +23,12 @@ pub const CacheKey = struct {
         return a.hash_type == b.hash_type and std.mem.eql(u8, a.slice(), b.slice());
     }
 
+    /// `CryptoHash::is_zero`: an alternate with no data has a zero key.
+    pub fn isZero(self: *const CacheKey) bool {
+        for (self.slice()) |b| if (b != 0) return false;
+        return true;
+    }
+
     pub const ParseError = error{ InvalidLength, InvalidCharacter };
 
     /// Parse a key written as hex digits; the length must match `hash_type`.

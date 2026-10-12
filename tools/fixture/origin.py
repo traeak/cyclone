@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Origin server for the cache test fixture.
 
-Every body is generated from its path (and Accept-Encoding, for /vary/), so a
-body read back out of the cache can be checked against body_for().
+Every body is generated from its path (and Accept-Encoding, for /vary/, or
+Accept-Language, for /lang/), so a body read back out of the cache can be
+checked against body_for().
 
   /small/N     a few bytes to ~20 KB, one fragment
   /large/N     3 MB and up, several fragments
   /huge/N      9 MB and up, more fragments than fit in an alternate's
                integral offset table (4)
   /vary/N      Vary: Accept-Encoding, one alternate per encoding asked for
+  /lang/N      Vary: Accept-Language, and Content-Language: the first
+               language asked for
   /query?...   same path, the query makes the key differ
 
 usage: origin.py PORT
@@ -32,9 +35,9 @@ def body_len(path):
     return 1000 + n
 
 
-def body_for(path_and_query, accept_encoding=""):
+def body_for(path_and_query, selector=""):
     """Deterministic body: SHA-256 counter stream seeded by the request."""
-    seed = (path_and_query + "|" + accept_encoding).encode()
+    seed = (path_and_query + "|" + selector).encode()
     length = body_len(urlsplit(path_and_query).path)
     out = bytearray()
     counter = 0
@@ -49,8 +52,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         vary = self.path.startswith("/vary/")
-        encoding = self.headers.get("Accept-Encoding", "") if vary else ""
-        body = body_for(self.path, encoding)
+        lang = self.path.startswith("/lang/")
+        if vary:
+            selector = self.headers.get("Accept-Encoding", "")
+        elif lang:
+            selector = self.headers.get("Accept-Language", "")
+        else:
+            selector = ""
+        body = body_for(self.path, selector)
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
@@ -58,7 +67,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Last-Modified", "Mon, 05 Oct 2026 12:00:00 GMT")
         if vary:
             self.send_header("Vary", "Accept-Encoding")
-            self.send_header("X-Encoding", encoding or "none")
+            self.send_header("X-Encoding", selector or "none")
+        if lang:
+            self.send_header("Vary", "Accept-Language")
+            first = selector.split(",")[0].split(";")[0].strip()
+            if first:
+                self.send_header("Content-Language", first)
         self.end_headers()
         self.wfile.write(body)
 

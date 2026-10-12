@@ -1,11 +1,14 @@
 #!/bin/sh
-# Builds two small programs against ATS master's own header code:
+# Builds three small programs against ATS master's own header code:
 #   layout   prints the struct layout of a marshalled alternate; its output is
 #            src/testdata/hdr_layout.txt, which a unit test checks cyclone's
 #            offsets against.
 #   altdump  decodes alternate vectors with HTTPInfo::unmarshal. Given a
 #            fixture, it writes FIXTURE/alts_golden.txt for every Doc with a
 #            header, which tools/fixture/check.sh compares with cyc-doc.
+#   selectq  runs ATS's alternate matching (HttpTransactCache.cc) on the cases
+#            from gen-select-cases.py; its output is
+#            src/testdata/select_golden.txt, which src/select.zig's tests replay.
 #
 # usage: tools/ats-httpinfo/build.sh ATS_SOURCE_DIR [BUILD_DIR [FIXTURE_DIR]]
 #
@@ -41,9 +44,18 @@ for prog in layout altdump; do
   eval "$compile -o $prog.o -c $here/$prog.cc"
   eval "$(echo "$link" | sed "s/PROG/$prog/g")"
 done
+# selectq also needs HttpTransactCache.cc (from the cache library) and the
+# global hook table; it stubs the rest of src/api.
+eval "$compile -o selectq.o -c $here/selectq.cc"
+eval "$compile -o HttpTransactCache.o -c $src/src/iocore/cache/HttpTransactCache.cc"
+eval "$compile -o HttpAPIHooks.o -c $src/src/api/HttpAPIHooks.cc"
+eval "$(echo "$link" | sed "s/PROG\.o/selectq.o HttpTransactCache.o HttpAPIHooks.o/; s/PROG/selectq/g")"
 
 ./layout > "$root/src/testdata/hdr_layout.txt"
 echo "wrote src/testdata/hdr_layout.txt ($(wc -l < "$root/src/testdata/hdr_layout.txt") lines)"
+
+python3 -I "$here/gen-select-cases.py" | ./selectq > "$root/src/testdata/select_golden.txt"
+echo "wrote src/testdata/select_golden.txt ($(grep -c '^case ' "$root/src/testdata/select_golden.txt") cases)"
 
 if [ -n "$fixture" ]; then
   fix=$fixture

@@ -10,7 +10,8 @@ const usage =
     \\usage: cyc-doc span   --span PATH... [--json]
     \\       cyc-doc stripe --span PATH... [--block SPAN:BLOCK] [--avg-obj-size [VOL=]N] [--json]
     \\       cyc-doc dir    --span PATH... [--block SPAN:BLOCK] [--segment N] [--entries [--docs]] [--json]
-    \\       cyc-doc object   --span PATH... KEY|URL [--alt N] [--headers | --body] [--json]
+    \\       cyc-doc object   --span PATH... KEY|URL [--alt N | --select [--req-header 'NAME: VALUE']...]
+    \\                                 [--range SPEC] [--headers | --body] [--json]
     \\       cyc-doc fragment --span PATH... --at SPAN:OFFSET [--headers | --data] [--json]
     \\
     \\Read cached objects, and inspect the structures that hold them.
@@ -22,7 +23,6 @@ const usage =
     \\  object              a whole object: its alternates and the fragments of one,
     \\                      checked as ATS reads them; --body writes the body
     \\  fragment            one Doc: its header and, for an HTTP head, its alternates
-    \\  (object reading: not implemented yet)
     \\
     \\options:
     \\
@@ -35,8 +35,24 @@ const usage =
     \\  --at S:OFFSET       fragment: the Doc at byte OFFSET of span S (as cyc-lookup
     \\                      and `dir --entries` print offsets)
     \\  --alt N             object: the alternate to read (default 0)
-    \\  --body              object: write the alternate's body to stdout; exits 1 if
-    \\                      it is incomplete
+    \\  --select            object: choose the alternate as ATS would for a GET with the
+    \\                      --req-header fields (none: a request with no headers); exits
+    \\                      1 when none matches. The fields are taken as ATS has them at
+    \\                      the cache lookup, after remap; Accept-Encoding is normalized
+    \\                      as proxy.config.http.normalize_ae says (default 1)
+    \\  --req-header 'NAME: VALUE'
+    \\                      object: a request field for --select (implies it); repeat
+    \\                      for more, in order
+    \\  --record NAME=VALUE object: a records.yaml setting --select follows:
+    \\                      proxy.config.http.normalize_ae (0-5),
+    \\                      proxy.config.http.cache.ignore_accept_mismatch (0-2) and its
+    \\                      _charset_, _encoding_ and _language_ variants,
+    \\                      proxy.config.http.global_user_agent_header
+    \\  --range SPEC        object: only these body bytes, as an HTTP Range: FIRST-LAST,
+    \\                      FIRST- or -SUFFIX (one range; "bytes=" optional); reads only
+    \\                      the fragments that hold them
+    \\  --body              object: write the alternate's body (or --range) to stdout;
+    \\                      exits 1 if it is incomplete
     \\  --volumes N,M,...   object: the host record's volumes (as for cyc-lookup)
     \\  --headers           object, fragment: print every stored request and response
     \\                      field
@@ -86,6 +102,21 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--alt")) {
             const text = it.value(arg);
             obj_opts.alt = std.fmt.parseInt(usize, text, 10) catch cli.fatal("bad --alt '{s}'", .{text});
+            obj_opts.alt_given = true;
+        } else if (std.mem.eql(u8, arg, "--select")) {
+            obj_opts.select = true;
+        } else if (std.mem.eql(u8, arg, "--req-header")) {
+            const text = it.value(arg);
+            const colon = std.mem.indexOfScalar(u8, text, ':') orelse cli.fatal("--req-header wants 'NAME: VALUE', got '{s}'", .{text});
+            const name = std.mem.trim(u8, text[0..colon], " \t");
+            if (name.len == 0) cli.fatal("--req-header wants 'NAME: VALUE', got '{s}'", .{text});
+            try obj_opts.request.append(arena, .{ .name = name, .value = std.mem.trim(u8, text[colon + 1 ..], " \t") });
+            obj_opts.select = true;
+        } else if (std.mem.eql(u8, arg, "--record")) {
+            parseRecord(&obj_opts.select_config, it.value(arg));
+        } else if (std.mem.eql(u8, arg, "--range")) {
+            const text = it.value(arg);
+            obj_opts.range = cyclone.object.RangeSpec.parse(text) catch cli.fatal("bad --range '{s}': want FIRST-LAST, FIRST- or -SUFFIX (one range)", .{text});
         } else if (std.mem.eql(u8, arg, "--body")) {
             obj_opts.body = true;
         } else if (std.mem.eql(u8, arg, "--volumes")) {
@@ -650,10 +681,43 @@ fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
 const ObjectOptions = struct {
     input: ?[]const u8 = null,
     alt: usize = 0,
+    alt_given: bool = false,
+    select: bool = false,
+    request: std.ArrayList(cyclone.format.http.Field) = .empty,
+    select_config: cyclone.select.Config = .{},
+    range: ?cyclone.object.RangeSpec = null,
     headers: bool = false,
     body: bool = false,
     volumes: ?[]const i32 = null,
 };
+
+fn parseRecord(cfg: *cyclone.select.Config, text: []const u8) void {
+    const eq = std.mem.indexOfScalar(u8, text, '=') orelse cli.fatal("--record wants NAME=VALUE, got '{s}'", .{text});
+    const name = text[0..eq];
+    const value = text[eq + 1 ..];
+    if (std.mem.eql(u8, name, "proxy.config.http.global_user_agent_header")) {
+        cfg.global_user_agent_header = value.len != 0;
+        return;
+    }
+    const n = std.fmt.parseInt(u8, value, 10) catch cli.fatal("--record {s}: bad value '{s}'", .{ name, value });
+    const ignore = .{
+        .{ "proxy.config.http.cache.ignore_accept_mismatch", "ignore_accept_mismatch" },
+        .{ "proxy.config.http.cache.ignore_accept_charset_mismatch", "ignore_accept_charset_mismatch" },
+        .{ "proxy.config.http.cache.ignore_accept_encoding_mismatch", "ignore_accept_encoding_mismatch" },
+        .{ "proxy.config.http.cache.ignore_accept_language_mismatch", "ignore_accept_language_mismatch" },
+    };
+    inline for (ignore) |r| if (std.mem.eql(u8, name, r[0])) {
+        if (n > 2) cli.fatal("--record {s}: want 0, 1 or 2", .{name});
+        @field(cfg, r[1]) = @intCast(n);
+        return;
+    };
+    if (std.mem.eql(u8, name, "proxy.config.http.normalize_ae")) {
+        if (n > 5) cli.fatal("--record {s}: want 0 to 5", .{name});
+        cfg.normalize_ae = @intCast(n);
+        return;
+    }
+    cli.fatal("--record: '{s}' does not change alternate selection", .{name});
+}
 
 const ObjectReport = struct {
     input: []const u8,
@@ -664,14 +728,41 @@ const ObjectReport = struct {
     head_offset: u64 = 0,
     head: ?FragmentReport.DocReport = null,
     alternates: []const FragmentReport.AltReport = &.{},
+    /// How --select chose the alternate.
+    selection: ?SelectionReport = null,
     /// The alternate whose fragments are listed (null: non-HTTP object).
     selected: ?usize = null,
     object_size: u64 = 0,
+    /// With --range: the bytes asked for (last inclusive, as in HTTP).
+    range: ?struct { first: u64, last: u64, length: u64 } = null,
     covered: u64 = 0,
     complete: bool = false,
     fragments: []const FragmentEntry = &.{},
     problems: []const []const u8 = &.{},
     error_message: ?[]const u8 = null,
+
+    const SelectionReport = struct {
+        /// The request fields matched, after Accept-Encoding normalization.
+        request: []const cyclone.format.http.Field,
+        normalize_ae: u3,
+        chosen: ?usize,
+        alternates: []const Match,
+
+        const Match = struct {
+            index: usize,
+            /// The alternate has no data, and ATS skips it.
+            skipped: bool,
+            quality: f32,
+            /// Accept, Accept-Charset, Accept-Encoding, Accept-Language
+            /// (-2: not computed).
+            q: [4]f32,
+            /// "none", "some" or "all".
+            vary: []const u8,
+            /// The Vary field that differs.
+            vary_field: []const u8,
+            age: i64,
+        };
+    };
 
     const FragmentEntry = struct {
         index: usize,
@@ -688,6 +779,7 @@ fn objectCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: 
     const input = opts.input orelse cli.fatal("object needs a KEY or URL", .{});
     if (common.spans.items.len == 0) cli.fatal("object needs every --span, in order", .{});
     if (opts.body and json) cli.fatal("--body and --json do not mix", .{});
+    if (opts.select and opts.alt_given) cli.fatal("--alt and --select (or --req-header) do not mix", .{});
     const key = cli.parseKeyOrUrl(common.hash_type, input) catch cli.fatal("'{s}' is not a key, and not a URL that parses", .{input});
 
     const spans = try arena.alloc(Span, common.spans.items.len);
@@ -721,12 +813,39 @@ fn objectCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: 
         return finishObject(out, r, opts, json);
     }
 
-    const c = cyclone.object.chain(arena, &cache, &head, opts.alt) catch |err| {
-        r.error_message = try std.fmt.allocPrint(arena, "cannot follow the fragments: {s}", .{@errorName(err)});
+    var alt = opts.alt;
+    if (opts.select and head.alternates.len != 0) {
+        const cfg = opts.select_config;
+        const request = try cyclone.select.normalizeAcceptEncoding(arena, opts.request.items, cfg.normalize_ae);
+        const now = Io.Clock.real.now(io).toSeconds();
+        const sel = try cyclone.select.select(arena, cfg, request, head.alternates, now);
+        const matches = try arena.alloc(ObjectReport.SelectionReport.Match, sel.matches.len);
+        for (sel.matches, matches, 0..) |m, *mr, i| mr.* = .{
+            .index = i,
+            .skipped = m.skipped,
+            .quality = m.quality,
+            .q = m.q,
+            .vary = @tagName(m.variability),
+            .vary_field = m.vary_field,
+            .age = m.age,
+        };
+        r.selection = .{ .request = request, .normalize_ae = cfg.normalize_ae, .chosen = sel.index, .alternates = matches };
+        alt = sel.index orelse {
+            r.error_message = "no alternate matches the request; ATS would go to the origin";
+            return finishObject(out, r, opts, json);
+        };
+    }
+
+    const c = cyclone.object.chain(arena, &cache, &head, alt, opts.range) catch |err| {
+        r.error_message = switch (err) {
+            error.Unsatisfiable => try std.fmt.allocPrint(arena, "the range is not satisfiable: alternate {d} has {d} bytes", .{ alt, objectSize(head, alt) }),
+            else => try std.fmt.allocPrint(arena, "cannot follow the fragments: {s}", .{@errorName(err)}),
+        };
         return finishObject(out, r, opts, json);
     };
     r.selected = c.alternate;
     r.object_size = c.object_size;
+    if (opts.range != null) r.range = .{ .first = c.range.start, .last = c.range.end - 1, .length = c.range.len() };
     r.covered = c.covered;
     r.complete = c.complete;
     r.problems = c.problems;
@@ -743,16 +862,21 @@ fn objectCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: 
     r.fragments = entries;
 
     if (opts.body) {
-        const n = try cyclone.object.writeBody(gpa, &cache, &head, c, out);
+        const n = try cyclone.object.writeBody(&cache, &head, c, out);
         try out.flush();
-        if (n != c.object_size or !c.complete) {
-            std.debug.print("cyc-doc: body incomplete: wrote {d} of {d} bytes\n", .{ n, c.object_size });
+        if (n != c.range.len() or !c.complete) {
+            std.debug.print("cyc-doc: body incomplete: wrote {d} of {d} bytes\n", .{ n, c.range.len() });
             for (c.problems) |p| std.debug.print("  {s}\n", .{p});
             std.process.exit(1);
         }
         return;
     }
     return finishObject(out, r, opts, json);
+}
+
+fn objectSize(head: cyclone.object.Head, alt: usize) u64 {
+    if (head.alternates.len == 0) return head.doc.total_len;
+    return @intCast(@max(0, head.alternates[alt].object_size));
 }
 
 fn finishObject(out: *Io.Writer, r: ObjectReport, opts: ObjectOptions, json: bool) !void {
@@ -762,7 +886,7 @@ fn finishObject(out: *Io.Writer, r: ObjectReport, opts: ObjectOptions, json: boo
     } else if (!opts.body) {
         try printObject(out, r, opts);
     }
-    if (r.error_message != null and (opts.body or !r.found)) {
+    if (r.error_message != null and (opts.body or !r.found or r.selected == null)) {
         try out.flush();
         if (opts.body) std.debug.print("cyc-doc: {s}: {s}\n", .{ r.input, r.error_message.? });
         std.process.exit(1);
@@ -778,12 +902,19 @@ fn printObject(out: *Io.Writer, r: ObjectReport, opts: ObjectOptions) !void {
     }
     if (r.alternates.len != 0) try out.print("alternates  {d}\n", .{r.alternates.len});
     for (r.alternates) |a| try printAlt(out, a, opts.headers);
+    if (r.selection) |sel| try printSelection(out, sel);
     if (r.found and r.error_message == null) {
         try out.writeByte('\n');
         if (r.selected) |i| try out.print("body        alt {d}: ", .{i}) else try out.writeAll("body        ");
-        try out.print("{d} bytes in {d} fragment{s}", .{ r.object_size, r.fragments.len, if (r.fragments.len == 1) "" else "s" });
+        if (r.range) |rg| {
+            try out.print("bytes {d}-{d} of {d} ({d} bytes), {d} fragment{s} read", .{ rg.first, rg.last, r.object_size, rg.length, r.fragments.len, if (r.fragments.len == 1) "" else "s" });
+        } else {
+            try out.print("{d} bytes in {d} fragment{s}", .{ r.object_size, r.fragments.len, if (r.fragments.len == 1) "" else "s" });
+        }
         if (r.complete) {
             try out.writeAll(", complete\n");
+        } else if (r.range != null) {
+            try out.print(", data found up to byte {d}: INCOMPLETE\n", .{r.covered});
         } else {
             try out.print(", {d} bytes found: INCOMPLETE\n", .{r.covered});
         }
@@ -798,6 +929,34 @@ fn printObject(out: *Io.Writer, r: ObjectReport, opts: ObjectOptions) !void {
         for (r.problems) |p| try out.print("problem: {s}\n", .{p});
     }
     if (r.error_message) |m| try out.print("error: {s}\n", .{m});
+}
+
+fn printSelection(out: *Io.Writer, sel: ObjectReport.SelectionReport) !void {
+    try out.writeAll("\nselect      ");
+    if (sel.chosen) |i| try out.print("alt {d}", .{i}) else try out.writeAll("none (a miss)");
+    try out.print(" for a GET with {d} field{s} (normalize_ae {d})\n", .{ sel.request.len, if (sel.request.len == 1) "" else "s", sel.normalize_ae });
+    for (sel.request) |f| try out.print("            > {s}: {s}\n", .{ f.name, f.value });
+    for (sel.alternates) |m| {
+        try out.print("  alt {d: <4}  ", .{m.index});
+        if (m.skipped) {
+            try out.writeAll("skipped: no data\n");
+            continue;
+        }
+        if (std.mem.eql(u8, m.vary, "some")) {
+            try out.print("ruled out: Vary {s} differs", .{m.vary_field});
+        } else if (std.mem.eql(u8, m.vary, "all")) {
+            try out.writeAll("ruled out: Vary *");
+        } else if (m.quality < 0) {
+            const names = [_][]const u8{ "Accept", "Accept-Charset", "Accept-Encoding", "Accept-Language" };
+            for (m.q, names) |q, n| if (q < 0 and q != -2) {
+                try out.print("ruled out: {s} does not accept it", .{n});
+                break;
+            };
+        } else {
+            try out.print("quality {d:.4}", .{m.quality});
+        }
+        try out.print("  (accept {d}, charset {d}, encoding {d}, language {d}; age {d} s)\n", .{ m.q[0], m.q[1], m.q[2], m.q[3], m.age });
+    }
 }
 
 const FragmentOptions = struct {

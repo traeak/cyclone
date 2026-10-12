@@ -230,8 +230,8 @@ startup, ATS runs recovery (`handle_recover_from_data`) and may drop
 entries near `write_pos` that were written after the last directory sync.
 cyclone reports the directory as it is on disk.
 
-Verified against the fixture: all 49 distinct cache keys have a head entry
-at the bucket and tag their key predicts. In each stripe, the approximate
+Verified against the fixture: every distinct cache key has a head entry at
+the bucket and tag its key predicts. In each stripe, the approximate
 entry sizes add up exactly to how far `write_pos` advanced.
 
 ## Key → stripe
@@ -285,9 +285,10 @@ Then the stripe's directory is probed as described under Directory.
 
 Verified against the fixture (`tools/fixture/check.sh`): ATS logged
 "requested 6542/6542/13082/6541, got 6780/6976/11036/7915", and
-`cyc-lookup --table` reproduces it. All 49 URLs resolve to exactly one valid
-head entry. With the wrong span seed, 20–28 of the 49 resolve to the wrong
-stripe and miss, so `--seed` must match what ATS hashed.
+`cyc-lookup --table` reproduces it. Every URL resolves to exactly one valid
+head entry. With the wrong span seed, 20–28 of the 49 URLs the fixture had
+then resolved to the wrong stripe and missed, so `--seed` must match what
+ATS hashed.
 
 ## Doc (fragment header)
 
@@ -353,10 +354,13 @@ So a lookup by a URL's key confirms a hit when the entry's Doc has
 `first_key == key`, which is what `CacheVC::openReadStartHead` checks; a
 mismatch is a tag collision and the probe goes on.
 
-In the fixture, there are 56 head entries for 50 URLs: 50 vectors (each
+In the fixture, there are 59 head entries for 51 URLs: 51 vectors (each
 filed under its URL's key), 4 earliest fragments of the 4 multi-fragment
-objects, and the 2 original Docs of the 2 Vary objects
-(`tools/fixture/check.sh`, check 5). Each multi-fragment object is a 2.4 KB
+objects, and 4 older Docs of the Vary objects that still hold an
+alternate's body: one each for the two 2-alternate objects, two for the
+3-alternate one (`tools/fixture/check.sh`, check 5). Each time an alternate
+is added, the previous Doc stays, filed under the key of the alternate whose
+body it holds. Each multi-fragment object is a 2.4 KB
 vector Doc plus 1 MiB data fragments.
 
 ## Alternates (`HTTPInfo`)
@@ -461,7 +465,8 @@ How ATS reads an object (`CacheVC::openReadStartHead`,
    valid and whose Doc has `first_key == key` (a mismatch is a collision and
    the probe goes on).
 2. Decode the alternates and pick one (ATS: `SelectFromAlternates` on the
-   request, or 0 when `select_alternate` is off; cyclone: `--alt N`, default 0).
+   request, or 0 when `select_alternate` is off; cyclone: `--alt N`, default
+   0, or `--select` as below).
    ATS refuses the alternate if its response `Content-Length` differs from
    `object_size`.
 3. `key = alternate.object_key`. If that is the head Doc's own `key`, the
@@ -484,8 +489,64 @@ fragment; for a whole read it is a consistency check. In the fixture every
 fragment but the last holds 1048504 bytes (1 MiB less the Doc); the last
 holds the rest, here up to 1053251.
 
-Verified on the fixture (`tools/fixture/check.sh`, check 7): for all 50
-URLs, every alternate is complete and its body is byte for byte one the
+Verified on the fixture (`tools/fixture/check.sh`, check 7): for every
+URL, every alternate is complete and its body is byte for byte one the
 origin sent for that URL, and every body sent is in some alternate. That
 covers single-fragment objects, bodies in the head Doc, Vary alternates whose
 body is in the original Doc, and 3- and 9-fragment objects.
+
+### Range reads
+
+To read from body offset `start`, ATS (`CacheVC::openReadMain`, seek_to)
+takes the fragment whose start is the last one in the offset table at or
+before `start` (fragment 0 if none), steps the key that many times with
+`next_CacheKey`, and reads from `start - fragment start` in its data. With
+no table the object is one fragment. cyclone does the same
+(`object.chain` with a `RangeSpec`), probes only the fragments that hold the
+range, and reads only the bytes it needs from each.
+
+Verified on the fixture (check 8): for every alternate, ranges at and around
+each fragment boundary, suffixes and open ends give the bytes of the whole
+body, and the fragments read are exactly those the table puts the range in.
+
+## Choosing an alternate
+
+`HttpTransactCache::SelectFromAlternates` (HttpTransactCache.cc), ported in
+`src/select.zig`:
+
+- The request it matches is the client request after remap, with
+  Accept-Encoding normalized (`proxy.config.http.normalize_ae`, default 1:
+  `gzip` if the header accepts gzip with q > 0, else the header is removed).
+  So with the defaults, `br` and `identity` requests share one alternate.
+- Each alternate with a non-zero `object_key` gets a quality: the product of
+  Accept (against the stored response's Content-Type), Accept-Charset (its
+  charset; utf-8 if none), Accept-Encoding (Content-Encoding) and
+  Accept-Language (Content-Language). Any of them below 0 makes it -1. Each
+  check is skipped (1.0) per `proxy.config.http.cache.ignore_accept_*_mismatch`;
+  the default 2 skips them unless the stored response has Vary. When neither
+  request has the header, or both have it byte for byte, the factor is
+  1.001.
+- Then Vary: every header it names must be in both requests with equal
+  comma-separated values (case and white space aside), or in neither;
+  `Vary: *` never matches.
+- The highest quality wins; a tie goes to the smaller document age
+  (RFC 2616 13.2.3 from the stored times, Age and Date), and among equal
+  ages to the later alternate. Nothing is chosen unless the best quality is
+  above 0, and then ATS goes to the origin.
+
+The header parsing follows ATS's own quirks, which decide edge cases:
+q values are read by `sscanf("%f")` from at most 7 bytes; a gzip request
+against an identity alternate whose stored request had no Accept-Encoding is
+a mismatch ("always try to fetch gzip"); `image/webp` needs an explicit
+Accept match; and in a Vary comparison, a list ending in an empty item (`a, ,`
+or a duplicate field `""`) has an extra zero-length value.
+
+Verified two ways. `tools/ats-httpinfo/selectq.cc` runs ATS's own
+`calculate_quality_of_match`, the four `calculate_quality_of_*_match`
+functions, `CalcVariability`, `match_content_encoding` and
+`mime_parse_date` on the cases from `gen-select-cases.py`; the unit tests
+replay its output (`src/testdata/select_golden.txt`, 808 cases and 27 dates).
+40,000 further random cases also matched. And `make-fixture.sh` asks the live
+ATS for 29 variants of three objects with `Cache-Control: only-if-cached`;
+check 9 confirms `cyc-doc object --select` picks the alternate whose body
+ATS served, and nothing where ATS answered 504.
