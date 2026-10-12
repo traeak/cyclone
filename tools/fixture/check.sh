@@ -135,4 +135,41 @@ else
   echo "skip  alternates (no alts_golden.txt; see tools/ats-httpinfo/build.sh)"
 fi
 
+# 7. Whole objects: every alternate of every URL is complete, and its body
+#    is one the origin sent for that URL (manifest.tsv: length and sha256);
+#    every body the origin sent is in some alternate.
+got=$(python3 -I - "$bin/cyc-doc" "$fix/manifest.tsv" $spans <<'PY'
+import collections, hashlib, json, subprocess, sys
+tool, manifest, spans = sys.argv[1], sys.argv[2], sys.argv[3:]
+sent = collections.defaultdict(set)
+for line in open(manifest).read().splitlines()[1:]:
+    url, _, length, sha = line.split("\t")
+    sent[url].add((int(length), sha))
+bad = []
+alts = 0
+for url, bodies in sorted(sent.items()):
+    r = json.loads(subprocess.run([tool, "object", *spans, url, "--json"], capture_output=True, text=True).stdout)
+    if not r["found"]:
+        bad.append(url + ": not found")
+        continue
+    seen = set()
+    for i in range(len(r["alternates"])):
+        alts += 1
+        p = subprocess.run([tool, "object", *spans, url, "--alt", str(i), "--body"], capture_output=True)
+        body = (len(p.stdout), hashlib.sha256(p.stdout).hexdigest())
+        if p.returncode != 0:
+            bad.append("%s alt %d: %s" % (url, i, p.stderr.decode().strip()))
+        elif body not in bodies:
+            bad.append("%s alt %d: body not one the origin sent" % (url, i))
+        seen.add(body)
+    for b in bodies - seen:
+        bad.append("%s: no alternate has the %d-byte body %s" % (url, b[0], b[1][:12]))
+for b in bad:
+    print("  " + b, file=sys.stderr)
+print("%d URLs, %d problems\t%d" % (len(sent), len(bad), alts))
+PY
+)
+check "whole objects ($(echo "$got" | cut -f2) alternates, bodies match the origin)" \
+  "$(echo "$urls" | wc -l | tr -d ' ') URLs, 0 problems" "$(echo "$got" | cut -f1)"
+
 exit $fail

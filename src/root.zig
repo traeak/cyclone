@@ -12,6 +12,8 @@ pub const stripe = @import("stripe.zig");
 pub const dir = @import("dir.zig");
 pub const assign = @import("assign.zig");
 pub const doc = @import("doc.zig");
+pub const cache = @import("cache.zig");
+pub const object = @import("object.zig");
 pub const format = struct {
     pub const span = @import("format/span.zig");
     pub const stripe = @import("format/stripe.zig");
@@ -24,6 +26,7 @@ pub const HashType = hash.HashType;
 pub const CacheKey = key.CacheKey;
 pub const Span = span.Span;
 pub const Stripe = stripe.Stripe;
+pub const Cache = cache.Cache;
 
 test {
     @import("std").testing.refAllDecls(@This());

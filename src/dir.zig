@@ -118,6 +118,61 @@ pub const ChainIterator = struct {
     }
 };
 
+/// One bucket's chain, read from disk an entry at a time: a lookup visits a
+/// few entries, where `Segment.read` loads up to 640 KB.
+pub const DiskChain = struct {
+    io: Io,
+    stripe: *const Stripe,
+    /// Byte offset of the segment's first entry.
+    base: u64,
+    entries: u64,
+    next_index: ?u64,
+    steps: u64 = 0,
+    err: ?ChainError = null,
+
+    pub fn init(io: Io, stripe: *const Stripe, segment: u64, bucket: u64) !DiskChain {
+        const copy = stripe.chosen orelse return error.NoUsableDirectory;
+        const g = stripe.geometry;
+        if (segment >= g.segments or bucket >= g.buckets) return error.NoSuchBucket;
+        const entries = g.buckets * fmt.depth;
+        var it: DiskChain = .{
+            .io = io,
+            .stripe = stripe,
+            .base = g.entriesOffset(copy) + segment * entries * fmt.entry_len,
+            .entries = entries,
+            .next_index = bucket * fmt.depth,
+        };
+        // An empty head means an empty bucket, as for `Segment.chain`.
+        const head = try it.read(bucket * fmt.depth);
+        if (head.isEmpty()) it.next_index = null;
+        return it;
+    }
+
+    fn read(it: *const DiskChain, i: u64) !Dir {
+        var b: [fmt.entry_len]u8 = undefined;
+        if (try it.stripe.span.file.readPositionalAll(it.io, &b, it.base + i * fmt.entry_len) != b.len) return error.Truncated;
+        return Dir.decode(&b);
+    }
+
+    pub fn next(it: *DiskChain) !?Link {
+        const i = it.next_index orelse return null;
+        if (i >= it.entries) {
+            it.err = .bad_next;
+            it.next_index = null;
+            return null;
+        }
+        it.steps += 1;
+        if (it.steps > it.entries) {
+            it.err = .loop;
+            it.next_index = null;
+            return null;
+        }
+        const d = try it.read(i);
+        it.next_index = if (d.next() == 0) null else d.next();
+        return .{ .index = @intCast(i), .dir = d };
+    }
+};
+
 /// Counts for one segment, or summed over a stripe.
 pub const Stats = struct {
     entries: u64 = 0,

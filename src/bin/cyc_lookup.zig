@@ -6,7 +6,6 @@ const Io = std.Io;
 const cyclone = @import("cyclone");
 const cli = cyclone.cli;
 const assign = cyclone.assign;
-const dir = cyclone.dir;
 
 const usage =
     \\usage: cyc-lookup --span PATH... [options] KEY|URL...
@@ -33,6 +32,9 @@ const usage =
     \\  --volumes N,M,...   volumes of the host record, in order: a hosting.config
     \\                      volume= list or @volume= remap directive (default: all
     \\                      volumes, in the order ATS finds them on the spans)
+    \\  --stripe S:B        look in stripe block B of span S instead of the key's
+    \\                      own stripe: a data fragment's key must be looked up in
+    \\                      its object's stripe (where the URL's key leads)
     \\  --table             show how the assignment table splits slots over stripes
     \\  --json              machine-readable output
     \\
@@ -47,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
     var common: cli.Common = .{};
     var volumes: ?[]const i32 = null;
     var show_table = false;
+    var stripe_override: ?[2]usize = null;
     var json = false;
     var inputs: std.ArrayList([]const u8) = .empty;
     var from_stdin = false;
@@ -59,7 +62,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (try common.parse(arena, arg, &it)) {
             continue;
         } else if (std.mem.eql(u8, arg, "--volumes")) {
-            volumes = try parseVolumes(arena, it.value(arg));
+            volumes = try cli.parseVolumes(arena, it.value(arg));
+        } else if (std.mem.eql(u8, arg, "--stripe")) {
+            const text = it.value(arg);
+            const colon = std.mem.indexOfScalar(u8, text, ':') orelse cli.fatal("--stripe wants SPAN:BLOCK, got '{s}'", .{text});
+            stripe_override = .{
+                std.fmt.parseInt(usize, text[0..colon], 10) catch cli.fatal("bad --stripe '{s}'", .{text}),
+                std.fmt.parseInt(usize, text[colon + 1 ..], 10) catch cli.fatal("bad --stripe '{s}'", .{text}),
+            };
         } else if (std.mem.eql(u8, arg, "--table")) {
             show_table = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -87,16 +97,20 @@ pub fn main(init: std.process.Init) !void {
     }
     defer for (spans) |*s| s.close(gpa, io);
 
-    const refs = try assign.collectStripes(arena, spans, volumes, common.hash_type);
-    if (refs.len == 0) cli.fatal("no stripes{s}", .{if (volumes != null) " in the given --volumes" else ""});
-    var table = try assign.Table.build(gpa, refs);
-    defer table.deinit(gpa);
+    var cache = cyclone.Cache.init(gpa, io, spans, common.cacheConfig(volumes)) catch |err| switch (err) {
+        error.NoStripes => cli.fatal("no stripes{s}", .{if (volumes != null) " in the given --volumes" else ""}),
+        else => return err,
+    };
+    defer cache.deinit();
+    if (stripe_override) |o| {
+        if (o[0] >= spans.len or o[1] >= spans[o[0]].blocks.len or spans[o[0]].blocks[o[1]].free)
+            cli.fatal("--stripe {d}:{d}: no such stripe (see `cyc-doc span`)", .{ o[0], o[1] });
+    }
 
-    var finder: Finder = .{ .gpa = gpa, .io = io, .arena = arena, .spans = spans, .table = &table, .common = &common };
-    defer finder.deinit();
+    var finder: Finder = .{ .arena = arena, .cache = &cache, .hash_type = common.hash_type, .stripe_override = stripe_override };
 
     if (show_table) {
-        try printTable(out, spans, &table, json);
+        try printTable(out, spans, &cache.table, json);
         if (inputs.items.len == 0 and !from_stdin) return try out.flush();
         if (!json) try out.writeByte('\n');
     }
@@ -128,16 +142,6 @@ pub fn main(init: std.process.Init) !void {
         failed = true;
     };
     if (failed) std.process.exit(1);
-}
-
-fn parseVolumes(arena: std.mem.Allocator, text: []const u8) ![]const i32 {
-    var list: std.ArrayList(i32) = .empty;
-    var parts = std.mem.splitScalar(u8, text, ',');
-    while (parts.next()) |p| {
-        const v = std.fmt.parseInt(i32, std.mem.trim(u8, p, " "), 10) catch cli.fatal("bad --volumes '{s}'", .{text});
-        try list.append(arena, v);
-    }
-    return list.items;
 }
 
 const Candidate = struct {
@@ -210,6 +214,8 @@ const Result = struct {
     block_index: usize = 0,
     span: []const u8 = "",
     volume: i32 = 0,
+    /// Whether the stripe searched is the one ATS assigns the key to.
+    home: bool = true,
     segment: u64 = 0,
     bucket: u64 = 0,
     tag: u12 = 0,
@@ -219,105 +225,73 @@ const Result = struct {
     candidates: []const Candidate = &.{},
 };
 
-/// Looks keys up, keeping each stripe open after first use.
+/// Looks keys up through a `Cache`, which keeps stripes open.
 const Finder = struct {
-    gpa: std.mem.Allocator,
-    io: Io,
     arena: std.mem.Allocator,
-    spans: []cyclone.Span,
-    table: *const assign.Table,
-    common: *const cli.Common,
-    open: std.AutoHashMapUnmanaged([2]usize, cyclone.Stripe) = .empty,
-
-    fn deinit(f: *Finder) void {
-        var it = f.open.valueIterator();
-        while (it.next()) |s| s.close(f.gpa);
-        f.open.deinit(f.gpa);
-    }
-
-    fn stripe(f: *Finder, ref: *const assign.StripeRef) !*cyclone.Stripe {
-        const gop = try f.open.getOrPut(f.gpa, .{ ref.span_index, ref.block_index });
-        if (!gop.found_existing) {
-            const span = &f.spans[ref.span_index];
-            gop.value_ptr.* = cyclone.Stripe.open(f.gpa, f.io, span, ref.block_index, f.common.avgObjSize(ref.volume)) catch |err| {
-                _ = f.open.remove(.{ ref.span_index, ref.block_index });
-                return err;
-            };
-        }
-        return gop.value_ptr;
-    }
+    cache: *cyclone.Cache,
+    hash_type: cyclone.HashType,
+    /// `--stripe`: look in this stripe instead of the key's home stripe.
+    stripe_override: ?[2]usize,
 
     fn find(f: *Finder, text: []const u8) !Result {
         var r: Result = .{ .input = text };
-        const key = parseInput(f.common.hash_type, text) catch |err| {
+        const key = cli.parseKeyOrUrl(f.hash_type, text) catch |err| {
             r.error_message = switch (err) {
                 error.BadUrl => "not a key, and not a URL that parses",
             };
             return r;
         };
         r.key = try std.fmt.allocPrint(f.arena, "{f}", .{key});
-
         r.slot = assign.Table.slotOf(&key);
-        const ref = f.table.stripeFor(&key);
-        r.span_index = ref.span_index;
-        r.block_index = ref.block_index;
-        r.span = f.spans[ref.span_index].path;
-        r.volume = ref.volume;
 
-        const s = try f.stripe(ref);
+        const ref = f.cache.home(&key);
+        const where = f.stripe_override orelse .{ ref.span_index, ref.block_index };
+        r.span_index = where[0];
+        r.block_index = where[1];
+        r.span = f.cache.spans[where[0]].path;
+        r.volume = f.cache.spans[where[0]].blocks[where[1]].number;
+        r.home = f.stripe_override == null or (where[0] == ref.span_index and where[1] == ref.block_index);
+
+        const s = try f.cache.stripe(where[0], where[1]);
         if (s.chosen == null) {
             r.error_message = "the stripe has no usable directory (see cyc-doc stripe; is --avg-obj-size right?)";
             return r;
         }
-        const slot = dir.Slot.of(&key, s.geometry.segments, s.geometry.buckets);
-        r.segment = slot.segment;
-        r.bucket = slot.bucket;
-        r.tag = slot.tag;
+        const p = try f.cache.probe(f.arena, s, &key);
+        r.segment = p.slot.segment;
+        r.bucket = p.slot.bucket;
+        r.tag = p.slot.tag;
+        r.chain_length = p.chain_length;
 
-        var seg = try dir.Segment.read(f.gpa, f.io, s, slot.segment);
-        defer seg.deinit(f.gpa);
-        var candidates: std.ArrayList(Candidate) = .empty;
-        var chain = seg.chain(slot.bucket);
-        while (chain.next()) |link| {
-            r.chain_length += 1;
-            const d = link.dir;
-            if (d.isEmpty() or d.tag() != slot.tag) continue;
-            var c: Candidate = .{
-                .index = link.index,
-                .offset = dir.contentOffset(s, d),
+        const candidates = try f.arena.alloc(Candidate, p.candidates.len);
+        for (p.candidates, candidates) |c, *out| {
+            const d = c.dir;
+            out.* = .{
+                .index = c.index,
+                .offset = c.offset,
                 .approx_size = d.approxSize(),
                 .head = d.head(),
                 .pinned = d.pinned(),
                 .phase = d.phase(),
-                .valid = dir.entryValid(s, d),
+                .valid = c.valid,
+                .verdict = c.verdict,
+                .read_error = if (c.read_error) |e| @errorName(e) else null,
             };
-            if (cyclone.doc.readHeader(f.io, s.span.file, f.common.hash_type, c.offset)) |doc| {
-                const v = cyclone.doc.check(doc, d, &key);
-                c.verdict = v;
-                if (v != .bad_magic) c.doc = try .init(f.arena, doc);
-                if (v.found()) {
-                    if (c.valid) r.status = .hit else if (r.status == .miss) r.status = .stale;
-                }
-            } else |err| {
-                c.read_error = @errorName(err);
-            }
-            try candidates.append(f.arena, c);
+            if (c.doc) |h| if (c.verdict != .bad_magic) {
+                out.doc = try .init(f.arena, h);
+            };
+            if (c.verdict) |v| if (v.found()) {
+                if (c.valid) r.status = .hit else if (r.status == .miss) r.status = .stale;
+            };
         }
-        if (chain.err) |e| r.error_message = switch (e) {
+        if (p.chain_error) |e| r.error_message = switch (e) {
             .bad_next => "bucket chain has a next index past the segment",
             .loop => "bucket chain loops",
         };
-        r.candidates = candidates.items;
+        r.candidates = candidates;
         return r;
     }
 };
-
-fn parseInput(hash_type: cyclone.HashType, text: []const u8) error{BadUrl}!cyclone.CacheKey {
-    if (text.len == hash_type.keyLen() * 2) {
-        if (cyclone.CacheKey.parseHex(hash_type, text)) |k| return k else |_| {}
-    }
-    return cyclone.url.cacheKey(text, hash_type, .{}) catch error.BadUrl;
-}
 
 fn printDetail(out: *Io.Writer, r: Result) !void {
     if (r.key == null) {
@@ -327,7 +301,7 @@ fn printDetail(out: *Io.Writer, r: Result) !void {
     if (!std.mem.eql(u8, r.input, r.key.?)) try out.print("url         {s}\n", .{r.input});
     try out.print("key         {s}\n", .{r.key.?});
     try out.print("slot        {d} of {d}\n", .{ r.slot, assign.table_size });
-    try out.print("stripe      {d}:{d}  volume {d}  in {s}\n", .{ r.span_index, r.block_index, r.volume, r.span });
+    try out.print("stripe      {d}:{d}  volume {d}  in {s}{s}\n", .{ r.span_index, r.block_index, r.volume, r.span, if (r.home) "" else "  (--stripe; not this key's own stripe)" });
     if (r.error_message) |m| if (r.chain_length == 0) {
         try out.print("error: {s}\n", .{m});
         return;

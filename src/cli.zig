@@ -2,6 +2,9 @@
 
 const std = @import("std");
 const HashType = @import("hash.zig").HashType;
+const cache = @import("cache.zig");
+const url = @import("url.zig");
+const CacheKey = @import("key.zig").CacheKey;
 const default_avg_obj_size = @import("format/stripe.zig").default_avg_obj_size;
 
 /// Walks argv one option at a time.
@@ -43,7 +46,7 @@ pub const Common = struct {
     /// `--avg-obj-size N`: proxy.config.cache.min_average_object_size.
     avg_obj_size: u32 = default_avg_obj_size,
     /// `--avg-obj-size VOL=N`: storage.yaml per-volume avg_obj_size.
-    volume_avg_obj_size: std.ArrayList(struct { volume: i32, size: u32 }) = .empty,
+    volume_avg_obj_size: std.ArrayList(cache.Config.VolumeSize) = .empty,
 
     pub const hash_help =
         \\  --hash md5|sha256   cache key hash; ATS does not record it on disk (default: md5)
@@ -90,8 +93,17 @@ pub const Common = struct {
 
     /// The avg_obj_size that sized stripes of `volume`.
     pub fn avgObjSize(self: *const Common, volume: i32) u32 {
-        for (self.volume_avg_obj_size.items) |v| if (v.volume == volume) return v.size;
-        return self.avg_obj_size;
+        return self.cacheConfig(null).avgObjSize(volume);
+    }
+
+    /// The options as a `Cache` takes them.
+    pub fn cacheConfig(self: *const Common, volumes: ?[]const i32) cache.Config {
+        return .{
+            .hash_type = self.hash_type,
+            .avg_obj_size = self.avg_obj_size,
+            .volume_avg_obj_size = self.volume_avg_obj_size.items,
+            .volumes = volumes,
+        };
     }
 
     fn parseAvg(text: []const u8) u32 {
@@ -107,6 +119,26 @@ pub const Common = struct {
 };
 
 /// Prints `cyc: <message>` to stderr and exits with status 2.
+/// A cache key given as hex (as cyc-key prints it), or else a URL to make
+/// one from.
+pub fn parseKeyOrUrl(hash_type: HashType, text: []const u8) error{BadUrl}!CacheKey {
+    if (text.len == hash_type.keyLen() * 2) {
+        if (CacheKey.parseHex(hash_type, text)) |k| return k else |_| {}
+    }
+    return url.cacheKey(text, hash_type, .{}) catch error.BadUrl;
+}
+
+/// `--volumes N,M,...`.
+pub fn parseVolumes(arena: std.mem.Allocator, text: []const u8) ![]const i32 {
+    var list: std.ArrayList(i32) = .empty;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    while (parts.next()) |p| {
+        const v = std.fmt.parseInt(i32, std.mem.trim(u8, p, " "), 10) catch fatal("bad --volumes '{s}'", .{text});
+        try list.append(arena, v);
+    }
+    return list.items;
+}
+
 pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print("cyc: " ++ fmt ++ "\n", args);
     std.process.exit(2);

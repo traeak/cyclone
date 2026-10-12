@@ -10,6 +10,7 @@ const usage =
     \\usage: cyc-doc span   --span PATH... [--json]
     \\       cyc-doc stripe --span PATH... [--block SPAN:BLOCK] [--avg-obj-size [VOL=]N] [--json]
     \\       cyc-doc dir    --span PATH... [--block SPAN:BLOCK] [--segment N] [--entries [--docs]] [--json]
+    \\       cyc-doc object   --span PATH... KEY|URL [--alt N] [--headers | --body] [--json]
     \\       cyc-doc fragment --span PATH... --at SPAN:OFFSET [--headers | --data] [--json]
     \\
     \\Read cached objects, and inspect the structures that hold them.
@@ -18,6 +19,8 @@ const usage =
     \\  span                show span headers and their stripe blocks
     \\  stripe              show stripe geometry and directory headers
     \\  dir                 directory statistics; with --entries, every entry in use
+    \\  object              a whole object: its alternates and the fragments of one,
+    \\                      checked as ATS reads them; --body writes the body
     \\  fragment            one Doc: its header and, for an HTTP head, its alternates
     \\  (object reading: not implemented yet)
     \\
@@ -31,13 +34,18 @@ const usage =
     \\                      lengths, and which key the entry is filed under
     \\  --at S:OFFSET       fragment: the Doc at byte OFFSET of span S (as cyc-lookup
     \\                      and `dir --entries` print offsets)
-    \\  --headers           fragment: print every stored request and response field
+    \\  --alt N             object: the alternate to read (default 0)
+    \\  --body              object: write the alternate's body to stdout; exits 1 if
+    \\                      it is incomplete
+    \\  --volumes N,M,...   object: the host record's volumes (as for cyc-lookup)
+    \\  --headers           object, fragment: print every stored request and response
+    \\                      field
     \\  --data              fragment: write the fragment's data bytes to stdout
     \\  --json              machine-readable output
     \\
 ;
 
-const Command = enum { span, stripe, dir, fragment };
+const Command = enum { span, stripe, dir, object, fragment };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -49,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
     var only: ?[2]usize = null;
     var dir_opts: DirOptions = .{};
     var frag_opts: FragmentOptions = .{};
+    var obj_opts: ObjectOptions = .{};
 
     var it: cli.ArgIterator = .init(args);
     while (it.next()) |arg| {
@@ -73,6 +82,14 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, arg, "--headers")) {
             frag_opts.headers = true;
+            obj_opts.headers = true;
+        } else if (std.mem.eql(u8, arg, "--alt")) {
+            const text = it.value(arg);
+            obj_opts.alt = std.fmt.parseInt(usize, text, 10) catch cli.fatal("bad --alt '{s}'", .{text});
+        } else if (std.mem.eql(u8, arg, "--body")) {
+            obj_opts.body = true;
+        } else if (std.mem.eql(u8, arg, "--volumes")) {
+            obj_opts.volumes = try cli.parseVolumes(arena, it.value(arg));
         } else if (std.mem.eql(u8, arg, "--data")) {
             frag_opts.data = true;
         } else if (std.mem.eql(u8, arg, "--segment")) {
@@ -87,6 +104,8 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (command == null and !std.mem.startsWith(u8, arg, "-")) {
             command = std.meta.stringToEnum(Command, arg) orelse cli.fatal("unknown command '{s}'\n\n{s}", .{ arg, usage });
+        } else if (command == .object and obj_opts.input == null and !std.mem.startsWith(u8, arg, "--")) {
+            obj_opts.input = arg;
         } else {
             cli.fatal("unknown argument '{s}'\n\n{s}", .{ arg, usage });
         }
@@ -100,6 +119,7 @@ pub fn main(init: std.process.Init) !void {
         .span => try spanCommand(init.gpa, init.io, arena, out, common.spans.items, json),
         .stripe => try stripeCommand(init.gpa, init.io, arena, out, &common, only, json),
         .dir => try dirCommand(init.gpa, init.io, arena, out, &common, only, dir_opts, json),
+        .object => try objectCommand(init.gpa, init.io, arena, out, &common, obj_opts, json),
         .fragment => try fragmentCommand(init.gpa, init.io, arena, out, &common, frag_opts, json),
     }
     try out.flush();
@@ -627,6 +647,159 @@ fn printDir(out: *Io.Writer, r: DirReport, opts: DirOptions) !void {
     }
 }
 
+const ObjectOptions = struct {
+    input: ?[]const u8 = null,
+    alt: usize = 0,
+    headers: bool = false,
+    body: bool = false,
+    volumes: ?[]const i32 = null,
+};
+
+const ObjectReport = struct {
+    input: []const u8,
+    key: []const u8,
+    found: bool = false,
+    /// The object's stripe, as SPAN:BLOCK.
+    stripe: []const u8 = "",
+    head_offset: u64 = 0,
+    head: ?FragmentReport.DocReport = null,
+    alternates: []const FragmentReport.AltReport = &.{},
+    /// The alternate whose fragments are listed (null: non-HTTP object).
+    selected: ?usize = null,
+    object_size: u64 = 0,
+    covered: u64 = 0,
+    complete: bool = false,
+    fragments: []const FragmentEntry = &.{},
+    problems: []const []const u8 = &.{},
+    error_message: ?[]const u8 = null,
+
+    const FragmentEntry = struct {
+        index: usize,
+        key: []const u8,
+        body_start: u64,
+        data_len: u64,
+        offset: ?u64,
+        in_head: bool,
+        stale_only: bool,
+    };
+};
+
+fn objectCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out: *Io.Writer, common: *const cli.Common, opts: ObjectOptions, json: bool) !void {
+    const input = opts.input orelse cli.fatal("object needs a KEY or URL", .{});
+    if (common.spans.items.len == 0) cli.fatal("object needs every --span, in order", .{});
+    if (opts.body and json) cli.fatal("--body and --json do not mix", .{});
+    const key = cli.parseKeyOrUrl(common.hash_type, input) catch cli.fatal("'{s}' is not a key, and not a URL that parses", .{input});
+
+    const spans = try arena.alloc(Span, common.spans.items.len);
+    for (common.spans.items, spans) |arg, *sp| sp.* = try openSpan(gpa, io, out, arg);
+    defer for (spans) |*sp| sp.close(gpa, io);
+    var cache = cyclone.Cache.init(gpa, io, spans, common.cacheConfig(opts.volumes)) catch |err| switch (err) {
+        error.NoStripes => cli.fatal("no stripes{s}", .{if (opts.volumes != null) " in the given --volumes" else ""}),
+        else => return err,
+    };
+    defer cache.deinit();
+
+    var r: ObjectReport = .{ .input = input, .key = try std.fmt.allocPrint(arena, "{f}", .{key}) };
+    const ref = cache.home(&key);
+    r.stripe = try std.fmt.allocPrint(arena, "{d}:{d}", .{ ref.span_index, ref.block_index });
+
+    const head = cyclone.object.openHead(arena, &cache, &key) catch |err| {
+        r.error_message = try std.fmt.allocPrint(arena, "cannot read the object's head: {s}", .{@errorName(err)});
+        return finishObject(out, r, opts, json);
+    } orelse {
+        r.error_message = "not in the cache";
+        return finishObject(out, r, opts, json);
+    };
+    r.found = true;
+    r.head_offset = head.entry.offset;
+    r.head = try docReport(arena, head.doc, head.fragment, common.hash_type);
+    const alts = try arena.alloc(FragmentReport.AltReport, head.alternates.len);
+    for (head.alternates, alts, 0..) |a, *ar, i| ar.* = try altReport(arena, a, i);
+    r.alternates = alts;
+    if (alts.len != 0 and opts.alt >= alts.len) {
+        r.error_message = try std.fmt.allocPrint(arena, "no alternate {d}; there {s} {d}", .{ opts.alt, if (alts.len == 1) "is" else "are", alts.len });
+        return finishObject(out, r, opts, json);
+    }
+
+    const c = cyclone.object.chain(arena, &cache, &head, opts.alt) catch |err| {
+        r.error_message = try std.fmt.allocPrint(arena, "cannot follow the fragments: {s}", .{@errorName(err)});
+        return finishObject(out, r, opts, json);
+    };
+    r.selected = c.alternate;
+    r.object_size = c.object_size;
+    r.covered = c.covered;
+    r.complete = c.complete;
+    r.problems = c.problems;
+    const entries = try arena.alloc(ObjectReport.FragmentEntry, c.fragments.len);
+    for (c.fragments, entries) |f, *e| e.* = .{
+        .index = f.index,
+        .key = try std.fmt.allocPrint(arena, "{f}", .{f.key}),
+        .body_start = f.body_start,
+        .data_len = f.data_len,
+        .offset = f.offset,
+        .in_head = f.in_head,
+        .stale_only = f.stale_only,
+    };
+    r.fragments = entries;
+
+    if (opts.body) {
+        const n = try cyclone.object.writeBody(gpa, &cache, &head, c, out);
+        try out.flush();
+        if (n != c.object_size or !c.complete) {
+            std.debug.print("cyc-doc: body incomplete: wrote {d} of {d} bytes\n", .{ n, c.object_size });
+            for (c.problems) |p| std.debug.print("  {s}\n", .{p});
+            std.process.exit(1);
+        }
+        return;
+    }
+    return finishObject(out, r, opts, json);
+}
+
+fn finishObject(out: *Io.Writer, r: ObjectReport, opts: ObjectOptions, json: bool) !void {
+    if (json) {
+        try std.json.Stringify.value(r, .{ .whitespace = .indent_2 }, out);
+        try out.writeByte('\n');
+    } else if (!opts.body) {
+        try printObject(out, r, opts);
+    }
+    if (r.error_message != null and (opts.body or !r.found)) {
+        try out.flush();
+        if (opts.body) std.debug.print("cyc-doc: {s}: {s}\n", .{ r.input, r.error_message.? });
+        std.process.exit(1);
+    }
+}
+
+fn printObject(out: *Io.Writer, r: ObjectReport, opts: ObjectOptions) !void {
+    if (!std.mem.eql(u8, r.input, r.key)) try out.print("url         {s}\n", .{r.input});
+    try out.print("key         {s}\n", .{r.key});
+    try out.print("stripe      {s}\n", .{r.stripe});
+    if (r.head) |d| {
+        try out.print("head        offset {d}: Doc {d} bytes (header {d}, data {d}), version {s}\n", .{ r.head_offset, d.len, d.hlen, d.data_len, d.version });
+    }
+    if (r.alternates.len != 0) try out.print("alternates  {d}\n", .{r.alternates.len});
+    for (r.alternates) |a| try printAlt(out, a, opts.headers);
+    if (r.found and r.error_message == null) {
+        try out.writeByte('\n');
+        if (r.selected) |i| try out.print("body        alt {d}: ", .{i}) else try out.writeAll("body        ");
+        try out.print("{d} bytes in {d} fragment{s}", .{ r.object_size, r.fragments.len, if (r.fragments.len == 1) "" else "s" });
+        if (r.complete) {
+            try out.writeAll(", complete\n");
+        } else {
+            try out.print(", {d} bytes found: INCOMPLETE\n", .{r.covered});
+        }
+        for (r.fragments) |f| {
+            try out.print("  {d: >4}  {s}  ", .{ f.index, f.key });
+            if (f.offset) |o| {
+                try out.print("offset {d: >12}  body {d}+{d}{s}\n", .{ o, f.body_start, f.data_len, if (f.in_head) "  (in the head Doc)" else "" });
+            } else {
+                try out.print("MISSING{s}\n", .{if (f.stale_only) " (a stale entry has it)" else ""});
+            }
+        }
+        for (r.problems) |p| try out.print("problem: {s}\n", .{p});
+    }
+    if (r.error_message) |m| try out.print("error: {s}\n", .{m});
+}
+
 const FragmentOptions = struct {
     at: ?struct { usize, u64 } = null,
     headers: bool = false,
@@ -717,7 +890,22 @@ fn fragmentCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out
         return;
     }
 
-    r.doc = .{
+    r.doc = try docReport(arena, doc, frag, hash_type);
+
+    if (doc.doc_type == .http and doc.hlen > 0) {
+        if (cyclone.doc.alternates(arena, frag, doc)) |alts| {
+            const reports = try arena.alloc(FragmentReport.AltReport, alts.len);
+            for (alts, reports, 0..) |a, *ar, i| ar.* = try altReport(arena, a, i);
+            r.alternates = reports;
+        } else |err| {
+            r.error_message = try std.fmt.allocPrint(arena, "cannot decode the alternates: {s}", .{@errorName(err)});
+        }
+    }
+    try printFragmentReport(out, r, opts, json);
+}
+
+fn docReport(arena: std.mem.Allocator, doc: cyclone.doc.Doc, frag: []const u8, hash_type: cyclone.HashType) !FragmentReport.DocReport {
+    return .{
         .magic = doc.magic,
         .len = doc.len,
         .total_len = doc.total_len,
@@ -739,17 +927,6 @@ fn fragmentCommand(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, out
             "bad",
         .single_fragment = doc.singleFragment(),
     };
-
-    if (doc.doc_type == .http and doc.hlen > 0) {
-        if (cyclone.doc.alternates(arena, frag, doc)) |alts| {
-            const reports = try arena.alloc(FragmentReport.AltReport, alts.len);
-            for (alts, reports, 0..) |a, *ar, i| ar.* = try altReport(arena, a, i);
-            r.alternates = reports;
-        } else |err| {
-            r.error_message = try std.fmt.allocPrint(arena, "cannot decode the alternates: {s}", .{@errorName(err)});
-        }
-    }
-    try printFragmentReport(out, r, opts, json);
 }
 
 fn altReport(arena: std.mem.Allocator, a: cyclone.format.http.Alternate, index: usize) !FragmentReport.AltReport {
@@ -797,35 +974,37 @@ fn printFragmentReport(out: *Io.Writer, r: FragmentReport, opts: FragmentOptions
         }
     }
     if (r.alternates.len != 0) try out.print("alternates  {d}\n", .{r.alternates.len});
-    for (r.alternates) |a| {
-        try out.print("\nalt {d}       {s} ", .{ a.index, a.method });
-        if (a.url) |u| try out.print("{f}", .{u});
-        try out.print("\n            {d} {s}, {d} bytes", .{ a.status, a.reason, a.object_size });
-        for (a.response_fields) |f| if (std.ascii.eqlIgnoreCase(f.name, "Content-Type")) {
-            try out.print(", {s}", .{f.value});
-            break;
-        };
-        try out.writeByte('\n');
-        for (a.response_fields) |f| if (std.ascii.eqlIgnoreCase(f.name, "Vary")) {
-            try out.print("            vary {s}\n", .{f.value});
-        };
-        try out.print("            object_key {s}, {d} fragment{s}", .{ a.object_key, a.frag_offsets.len + 1, if (a.frag_offsets.len == 0) "" else "s" });
-        if (a.frag_offsets.len != 0) {
-            try out.writeAll(" (starting at");
-            for (a.frag_offsets) |o| try out.print(" {d}", .{o});
-            try out.writeAll(")");
-        }
-        try out.print("\n            request sent {f}, response received {f}\n", .{ Time{ .secs = a.request_sent_time }, Time{ .secs = a.response_received_time } });
-        if (opts.headers) {
-            try out.print("            > {s} ", .{a.method});
-            if (a.url) |u| try out.print("{f}", .{u});
-            try out.print(" HTTP/{s}\n", .{a.request_version});
-            for (a.request_fields) |f| try out.print("            > {s}: {s}\n", .{ f.name, f.value });
-            try out.print("            < HTTP/{s} {d} {s}\n", .{ a.response_version, a.status, a.reason });
-            for (a.response_fields) |f| try out.print("            < {s}: {s}\n", .{ f.name, f.value });
-        }
-    }
+    for (r.alternates) |a| try printAlt(out, a, opts.headers);
     if (r.error_message) |m| try out.print("error: {s}\n", .{m});
+}
+
+fn printAlt(out: *Io.Writer, a: FragmentReport.AltReport, headers: bool) !void {
+    try out.print("\nalt {d}       {s} ", .{ a.index, a.method });
+    if (a.url) |u| try out.print("{f}", .{u});
+    try out.print("\n            {d} {s}, {d} bytes", .{ a.status, a.reason, a.object_size });
+    for (a.response_fields) |f| if (std.ascii.eqlIgnoreCase(f.name, "Content-Type")) {
+        try out.print(", {s}", .{f.value});
+        break;
+    };
+    try out.writeByte('\n');
+    for (a.response_fields) |f| if (std.ascii.eqlIgnoreCase(f.name, "Vary")) {
+        try out.print("            vary {s}\n", .{f.value});
+    };
+    try out.print("            object_key {s}, {d} fragment{s}", .{ a.object_key, a.frag_offsets.len + 1, if (a.frag_offsets.len == 0) "" else "s" });
+    if (a.frag_offsets.len != 0) {
+        try out.writeAll(" (starting at");
+        for (a.frag_offsets) |o| try out.print(" {d}", .{o});
+        try out.writeAll(")");
+    }
+    try out.print("\n            request sent {f}, response received {f}\n", .{ Time{ .secs = a.request_sent_time }, Time{ .secs = a.response_received_time } });
+    if (headers) {
+        try out.print("            > {s} ", .{a.method});
+        if (a.url) |u| try out.print("{f}", .{u});
+        try out.print(" HTTP/{s}\n", .{a.request_version});
+        for (a.request_fields) |f| try out.print("            > {s}: {s}\n", .{ f.name, f.value });
+        try out.print("            < HTTP/{s} {d} {s}\n", .{ a.response_version, a.status, a.reason });
+        for (a.response_fields) |f| try out.print("            < {s}: {s}\n", .{ f.name, f.value });
+    }
 }
 
 fn docTypeName(t: u8) []const u8 {

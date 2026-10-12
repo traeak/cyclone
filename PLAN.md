@@ -112,12 +112,12 @@ A port of `url_CryptoHash_get_general`: it lowercases and unescapes scheme and h
 
 ### `cyc-doc` — read a whole object
 ```
-cyc-doc --span cache.db --key 0123...cdef        [--alt N] [--headers] [--body > out.bin] [--json]
-cyc-doc --span cache.db --stripe 0 --dir-offset 0x1a2b3   [--fragment]     # start from a raw location
+cyc-doc object   --span cache.db KEY|URL [--alt N] [--headers | --body > out.bin] [--json]
+cyc-doc fragment --span cache.db --at SPAN:OFFSET [--headers | --data] [--json]   # one Doc, by location
 ```
 - Default output: object summary, the list of alternates (request URL, status, content type, size, Vary), and fragment chain health.
 - `--headers` prints the stored request/response headers. `--body` streams the reassembled body of the selected alternate.
-- `--fragment` reads only the Doc at that location (debug mode).
+- `fragment` reads only the Doc at one location (debug mode); `--data` writes its data bytes.
 - Supporting debug subcommands: `span` (DiskHeader + stripes), `stripe` (A/B headers, geometry, write_pos/phase), `dir` (walk/dump entries, stats).
 
 ### `cyc-lookup` — key → location
@@ -157,4 +157,5 @@ A daemon (`cyclone-d`) that opens the spans once, keeps stripe headers and direc
    - ~~`Doc` header~~ done: `src/format/doc.zig` (MD5 and FIPS layouts, checksum), `src/doc.zig` (read, verdict against a key). `cyc-lookup` confirms each tag match against the Doc: hit, stale, collision. `cyc-doc dir --docs` shows each entry's Doc and which key it is filed under. The 5 extra heads in the fixture are the 3 large objects' earliest fragments and the 2 Vary objects' second alternates (check 5 in `check.sh`).
 4. ~~Lookup~~ done.
 5. ~~HTTPInfo decoding~~ done: `src/format/http.zig` decodes the alternate vector (alternates, both heaps, URL, fields, fragment offset table, both table formats). Layout offsets are checked against ATS's compiled structs (`tools/ats-httpinfo`, `src/testdata/hdr_layout.txt`), and every fixture alternate matches ATS's own `HTTPInfo::unmarshal` (check 6). `cyc-doc fragment --at S:OFFSET [--headers|--data]` shows one Doc. Not verified: the FIPS layout (refused), and pre-24.2 Docs (no sample).
-6. Next: whole objects. Move the lookup into the library, then `cyc-doc object KEY|URL`: find the vector, pick an alternate, and follow `object_key` → `next_CacheKey` through the fragments, all in the head's stripe. `cyc-lookup` should also be able to look up a data-fragment key in a given stripe.
+6. ~~Whole objects~~ done: `src/cache.zig` (spans + assignment table + stripes + probe, shared by the tools and later the service), `src/object.zig` (head, alternates, fragment chain, body). `cyc-doc object KEY|URL [--alt N] [--headers | --body] [--json]` reports each fragment and any inconsistency, and `--body` streams the body (exit 1 if incomplete). `cyc-lookup --stripe S:B` finds a data-fragment key in its object's stripe. Check 7 compares every alternate's body with what the origin sent.
+7. Next: Phase 3, the service. Decide the protocol (HTTP/1.1 over UDS/TCP first), then expose lookup, object info and bodies over the transport-independent `Cache` API. Open before that: alternate selection by request headers (`--req-header`), and range reads using the fragment offset table.

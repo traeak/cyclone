@@ -450,3 +450,42 @@ decodes every head Doc with ATS's own `HTTPInfo::unmarshal`
 (`alts_golden.txt`), and check 6 of `tools/fixture/check.sh` compares all 54
 alternates field by field with `cyc-doc fragment`. That includes a 9-fragment
 object, whose 8 offsets need the external table.
+
+## Whole objects
+
+How ATS reads an object (`CacheVC::openReadStartHead`,
+`openReadStartEarliest`, `openReadReadDone` in `CacheRead.cc`), and how
+`src/object.zig` follows it:
+
+1. Find the head: probe the key's stripe and bucket; the first entry that is
+   valid and whose Doc has `first_key == key` (a mismatch is a collision and
+   the probe goes on).
+2. Decode the alternates and pick one (ATS: `SelectFromAlternates` on the
+   request, or 0 when `select_alternate` is off; cyclone: `--alt N`, default 0).
+   ATS refuses the alternate if its response `Content-Length` differs from
+   `object_size`.
+3. `key = alternate.object_key`. If that is the head Doc's own `key`, the
+   body is the head's data (a single-fragment object, `doc_pos = prefix_len`).
+4. Otherwise probe for `key` **in the head's stripe**: the first valid entry
+   whose Doc has `key == key`. Its data (after `prefix_len`) is the next part
+   of the body. Then `key = next_CacheKey(key)` and repeat until
+   `object_size` bytes are read. A missing fragment truncates the object
+   (ATS logs "Document ... truncated" and deletes the earliest entry).
+5. An object of size 0 reads no fragments.
+
+`next_CacheKey` maps byte 0 through a 256-entry permutation table and each
+later byte *i* through the table at `(next[i-1] + key[i]) & 0xff`
+(`CacheKey_next_table`, `CacheDir.cc`); `prev_CacheKey` is its inverse. A
+vector Doc written alone has `key = prev_CacheKey(earliest key)`.
+
+The alternate's fragment offset table gives where each fragment after the
+first starts in the body. ATS uses it to start a range read at the right
+fragment; for a whole read it is a consistency check. In the fixture every
+fragment but the last holds 1048504 bytes (1 MiB less the Doc); the last
+holds the rest, here up to 1053251.
+
+Verified on the fixture (`tools/fixture/check.sh`, check 7): for all 50
+URLs, every alternate is complete and its body is byte for byte one the
+origin sent for that URL, and every body sent is in some alternate. That
+covers single-fragment objects, bodies in the head Doc, Vary alternates whose
+body is in the original Doc, and 3- and 9-fragment objects.
