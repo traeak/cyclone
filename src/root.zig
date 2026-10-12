@@ -10,6 +10,7 @@ pub const url = @import("url.zig");
 pub const span = @import("span.zig");
 pub const stripe = @import("stripe.zig");
 pub const dir = @import("dir.zig");
+pub const assign = @import("assign.zig");
 pub const format = struct {
     pub const span = @import("format/span.zig");
     pub const stripe = @import("format/stripe.zig");

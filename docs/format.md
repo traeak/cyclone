@@ -233,3 +233,58 @@ cyclone reports the directory as it is on disk.
 Verified against the fixture: all 49 distinct cache keys have a head entry
 at the bucket and tag their key predicts. In each stripe, the approximate
 entry sizes add up exactly to how far `write_pos` advanced.
+
+## Key → stripe
+
+A key is stored in exactly one stripe, chosen through a 32707-slot table
+(`build_vol_hash_table` in `CacheProcessor.cc`, `Cache::key_to_stripe` in
+`Cache.cc`).
+
+### Which stripes, in which order
+
+The table belongs to a *host record*:
+
+- **Generic record** (no `hosting.config` entries): every HTTP volume, in
+  `cp_list` order. On a cache that already exists, `cplist_init` builds that
+  order by walking spans in configuration order, and each span's stripe
+  blocks in header order, adding each volume number the first time it
+  appears.
+- **`hosting.config` line or `@volume=` remap directive**: the listed
+  volumes, in the order listed (`CacheHostRecord::Init`).
+- **`proxy.config.cache.default_volumes`**: likewise a list of volumes.
+
+Within a volume, stripes come in span order, and within a span in header
+order (`Cache::open`). cyclone takes the list with `--volumes N,M,...`;
+the default is the generic record.
+
+### Building the table
+
+```
+for each stripe i:   requested[i] = 32707 * blocks_i / total_blocks     (+ remainder spread round-robin; informational)
+                     points: len_i / 8 MB values of the LCG
+                             x = x * 1103515145 + 12345 (u32), seeded with (u32) fold(hash_id_i)
+sort all (value, stripe) points by value
+width = 2^32 / 32707                                   # 131316
+for slot j:          pos = width / 2 + j * width
+                     advance to the first point with value >= pos (or the last point)
+                     table[j] = that point's stripe
+```
+- `hash_id` is MD5 of the stripe's hash text (`"<seed> <offset>:<len>"`;
+  see Span), or SHA-256 in FIPS builds.
+- `fold()` XORs its 64-bit words; the low 32 bits seed the LCG.
+- ATS sorts with `qsort`, which is not guaranteed stable. Equal values from
+  two stripes are possible but vanishingly rare.
+
+### Using it
+
+```
+slot   = (key.slice32(2) >> 12) % 32707
+stripe = record.stripes[table[slot]]
+```
+Then the stripe's directory is probed as described under Directory.
+
+Verified against the fixture (`tools/fixture/check.sh`): ATS logged
+"requested 6542/6542/13082/6541, got 6780/6976/11036/7915", and
+`cyc-lookup --table` reproduces it. All 49 URLs resolve to exactly one valid
+head entry. With the wrong span seed, 20–28 of the 49 resolve to the wrong
+stripe and miss, so `--seed` must match what ATS hashed.
