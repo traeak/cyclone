@@ -260,20 +260,30 @@ else
   echo "skip  alternate selection (no $fix/select.tsv; rerun make-fixture.sh)"
 fi
 
-# 10. The service: cyclone-d on a unix socket answers as the tools do, with
-#     its directories in memory and read from disk, and conditional requests
-#     as live ATS answered them (conditional.tsv).
+# 10. The service: cyclone-d answers as the tools do, with its directories
+#     in memory (over TCP) and read from disk (over a unix socket), and
+#     conditional requests as live ATS answered them (conditional.tsv).
 #     Bodies of every alternate, selection as ATS served it (select.tsv),
 #     ranges, If-Range, HEAD, JSON reports, errors, keep-alive, and many
 #     connections at once.
-for mode in "" --disk-directories; do
-label=${mode:+directories on disk}
-label=${label:-directories in memory}
+for run in memory disk; do
 tmp=$(mktemp -d)
-"$bin/cyclone-d" $spans --unix "$tmp/sock" $mode > "$tmp/log" 2>&1 &
+if [ $run = memory ]; then
+  mode=
+  port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  listen="--listen 127.0.0.1:$port"
+  addr="tcp:127.0.0.1:$port"
+  label="directories in memory, over TCP"
+else
+  mode=--disk-directories
+  listen="--unix $tmp/sock"
+  addr=$tmp/sock
+  label="directories on disk, over a unix socket"
+fi
+"$bin/cyclone-d" $spans $listen $mode > "$tmp/log" 2>&1 &
 daemon=$!
-for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
-got=$(python3 -I - "$bin" "$tmp/sock" "$fix/manifest.tsv" "$fix/select.tsv" "$fix/conditional.tsv" $spans <<'PY'
+for _ in $(seq 50); do grep -q 'listening on' "$tmp/log" && break; sleep 0.1; done
+got=$(python3 -I - "$bin" "$addr" "$fix/manifest.tsv" "$fix/select.tsv" "$fix/conditional.tsv" $spans <<'PY'
 import concurrent.futures, hashlib, json, os, socket, subprocess, sys, urllib.parse
 bindir, sock, manifest, select_tsv, conditional_tsv, spans = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 tool = os.path.join(bindir, "cyc-doc")
@@ -282,9 +292,14 @@ lookup_tool = os.path.join(bindir, "cyc-lookup")
 class Conn:
     """A minimal HTTP/1.1 client: exactly the header fields given."""
     def __init__(self):
-        self.s = socket.socket(socket.AF_UNIX)
-        self.s.settimeout(30)  # a protocol bug fails the check instead of hanging it
-        self.s.connect(sock)
+        if sock.startswith("tcp:"):
+            host, port = sock[4:].rsplit(":", 1)
+            self.s = socket.create_connection((host, int(port)), timeout=30)
+            self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        else:
+            self.s = socket.socket(socket.AF_UNIX)
+            self.s.settimeout(30)  # a protocol bug fails the check instead of hanging it
+            self.s.connect(sock)
         self.buf = b""
     def _read_until(self, sep):
         while sep not in self.buf:
@@ -480,7 +495,7 @@ print("%d problems\t%d" % (len(bad), n))
 PY
 )
 kill $daemon 2>/dev/null; wait $daemon 2>/dev/null || true
-check "service, $label ($(echo "$got" | cut -f2) requests over one socket, 32 at once)" "0 problems" "$(echo "$got" | cut -f1)"
+check "service, $label ($(echo "$got" | cut -f2) requests over one connection, 32 at once)" "0 problems" "$(echo "$got" | cut -f1)"
 # Anything the daemon said besides starting up is worth seeing.
 grep -v -e 'listening on' -e 'directories in memory' -e 'SIGTERM: stopping' -e ': stopped$' "$tmp/log" | sed 's/^/  /' >&2 || true
 rm -rf "$tmp"
@@ -532,5 +547,42 @@ wait $daemon || status=$?
 [ -e "$tmp/sock" ] && got="$got, socket file left"
 check "graceful shutdown (idle connection closed, body in flight finished)" "0 problems, exit 0" "$got, exit $status"
 rm -rf "$tmp"
+
+# 12. --backlog: with every connection slot taken, the kernel holds that
+#     many more waiting (a unix socket refuses the rest at once); by
+#     default, net.core.somaxconn (beyond the old 128).
+backlog_refused() { # BACKLOG-OPTION CONNECTIONS: how many were refused
+  tmp=$(mktemp -d)
+  "$bin/cyclone-d" $spans --unix "$tmp/sock" --max-connections 1 $1 > "$tmp/log" 2>&1 &
+  daemon=$!
+  for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
+  python3 -I - "$tmp/sock" "$2" <<'PY'
+import socket, sys, time
+sock, n = sys.argv[1], int(sys.argv[2])
+held = []
+# The first connection takes the one slot, the second the accept loop.
+for _ in range(2):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock)
+    held.append(s)
+    time.sleep(0.2)
+refused = 0
+for _ in range(n):
+    s = socket.socket(socket.AF_UNIX)
+    s.setblocking(False)
+    try:
+        s.connect(sock)
+        held.append(s)
+    except BlockingIOError:
+        refused += 1
+print(refused)
+PY
+  kill -KILL $daemon 2>/dev/null; wait $daemon 2>/dev/null || true
+  rm -rf "$tmp"
+}
+few=$(backlog_refused "--backlog 4" 30)
+default=$(backlog_refused "" 200)
+[ "$few" -gt 0 ] && few=some
+check "--backlog (some of 30 refused with 4, none of 200 by default)" "some, 0" "$few, $default"
 
 exit $fail

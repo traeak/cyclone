@@ -17,6 +17,7 @@ It takes the same span options as the tools (`--span`, `--seed`, `--skip`,
 | `--unix PATH` | listen on a unix socket (repeatable); a stale socket file is removed first |
 | `--listen HOST:PORT` | listen on TCP (repeatable); `[::1]:PORT` for IPv6 |
 | `--max-connections N` | connections served at once (default 256); beyond that, accepting waits |
+| `--backlog N` | connections the kernel holds waiting to be accepted, per listener (default and limit: `net.core.somaxconn`) |
 | `--record NAME=VALUE` | a records.yaml setting alternate selection follows (`normalize_ae`, `ignore_accept_*_mismatch`, `global_user_agent_header`) |
 | `--disk-directories` | read directories from the spans for each lookup instead of loading them at startup |
 | `--shutdown-timeout S` | on SIGTERM or SIGINT, how long requests in flight may take to finish (default 10) |
@@ -38,6 +39,18 @@ What a request reads from the spans, with directories in memory:
 
 With `--disk-directories`, each lookup also reads the bucket's entries, 10
 bytes at a time (usually two reads).
+
+## Connections
+
+Up to `--max-connections` connections are served at once, each by its own
+task. Beyond that, the accept loop serves one more itself, and new
+connections wait in the kernel's listen queue, `--backlog` long. When that is
+full, a unix socket refuses a connection at once (`EAGAIN` to a non-blocking
+client; a blocking one waits), while TCP drops it and the client retries
+later. The default is the kernel's limit, `net.core.somaxconn` (4096 on
+current Linux); raise that with sysctl for a longer queue.
+
+A unix socket path is at most 107 bytes (`sun_path`).
 
 ## Stopping
 
@@ -163,5 +176,6 @@ request's own fields as live ATS served it (`select.tsv`), `/v1/stripes`
 and `/v1/dir` against `cyc-doc stripe` and `cyc-doc dir --entries --docs`
 (with each filter and per segment), errors, and 32
 connections reading every large body at once; all over one keep-alive
-connection plus the 32. It runs twice, with directories in memory and with
-`--disk-directories`.
+connection plus the 32. It runs twice: with directories in memory over TCP,
+and with `--disk-directories` over a unix socket. Check 12 fills the
+connection slots and the listen queue, to see `--backlog` applied.

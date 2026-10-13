@@ -36,6 +36,8 @@ const usage =
     \\  --listen HOST:PORT  listen on TCP; repeatable ([::1]:PORT for IPv6)
     \\  --max-connections N connections served at once (default 256); beyond that,
     \\                      accepting waits
+    \\  --backlog N         connections the kernel holds waiting to be accepted, per
+    \\                      listener (default and limit: net.core.somaxconn)
     \\  --record NAME=VALUE a records.yaml setting alternate selection follows (see
     \\                      cyc-doc --help)
     \\  --disk-directories  read directories from the spans for each lookup instead
@@ -105,6 +107,8 @@ pub fn main(init: std.process.Init) !void {
     var select_config: cyclone.select.Config = .{};
     var options: http_server.Options = .{};
     var max_connections: u32 = 256;
+    // Linux lowers a backlog beyond net.core.somaxconn to it.
+    var backlog: u31 = std.math.maxInt(u31);
     var disk_directories = false;
     var shutdown_timeout: u32 = 10;
 
@@ -125,6 +129,10 @@ pub fn main(init: std.process.Init) !void {
             const text = it.value(arg);
             max_connections = std.fmt.parseInt(u32, text, 10) catch cli.fatal("bad --max-connections '{s}'", .{text});
             if (max_connections == 0) cli.fatal("--max-connections must be positive", .{});
+        } else if (std.mem.eql(u8, arg, "--backlog")) {
+            const text = it.value(arg);
+            backlog = std.fmt.parseInt(u31, text, 10) catch cli.fatal("bad --backlog '{s}'", .{text});
+            if (backlog == 0) cli.fatal("--backlog must be positive", .{});
         } else if (std.mem.eql(u8, arg, "--record")) {
             cli.parseRecord(&select_config, it.value(arg));
         } else if (std.mem.eql(u8, arg, "--shutdown-timeout")) {
@@ -171,12 +179,12 @@ pub fn main(init: std.process.Init) !void {
     for (unix_paths.items) |path| {
         removeStaleSocket(io, path);
         const addr = net.UnixAddress.init(path) catch cli.fatal("--unix {s}: path too long", .{path});
-        const server = addr.listen(io, .{}) catch |err| cli.fatal("--unix {s}: {s}", .{ path, @errorName(err) });
+        const server = addr.listen(io, .{ .kernel_backlog = backlog }) catch |err| cli.fatal("--unix {s}: {s}", .{ path, @errorName(err) });
         try listeners.append(arena, .{ .name = path, .server = server });
     }
     for (tcp.items) |text| {
         const addr = parseHostPort(text) orelse cli.fatal("--listen wants HOST:PORT, got '{s}'", .{text});
-        const server = addr.listen(io, .{ .reuse_address = true }) catch |err| cli.fatal("--listen {s}: {s}", .{ text, @errorName(err) });
+        const server = addr.listen(io, .{ .kernel_backlog = backlog, .reuse_address = true }) catch |err| cli.fatal("--listen {s}: {s}", .{ text, @errorName(err) });
         try listeners.append(arena, .{ .name = text, .server = server });
     }
     for (listeners.items) |l| std.debug.print("cyclone-d: listening on {s}\n", .{l.name});
