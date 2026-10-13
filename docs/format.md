@@ -455,6 +455,10 @@ decodes every head Doc with ATS's own `HTTPInfo::unmarshal`
 alternates field by field with `cyc-doc fragment`. That includes a 9-fragment
 object, whose 8 offsets need the external table.
 
+Field names are stored as the origin sent them (`ETag`). ATS's
+`MIMEField::name_get()` gives its own spelling for a well-known name
+(`Etag`), so names compare without case against ATS's decoding (check 6).
+
 ## Whole objects
 
 How ATS reads an object (`CacheVC::openReadStartHead`,

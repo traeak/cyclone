@@ -108,6 +108,27 @@ Range that cannot be served as one range (several ranges, bad syntax) is
 ignored and the whole body sent, as RFC 9110 allows. `If-Range` lets the
 range through only when it equals the stored strong ETag or Last-Modified.
 
+### Conditional requests
+
+As ATS answers them from the cache (`match_response_to_request_conditionals`,
+`build_response_from_cache`), before any range:
+
+| request | answer |
+|---|---|
+| If-None-Match, when the stored response has an ETag | 304 on a weak match (or `*`), else the response; If-Modified-Since is then not looked at |
+| If-Modified-Since | 304 unless Last-Modified (else Date, else the time ATS received the response) is newer |
+| If-Match | 412 unless it strongly matches the ETag; a weak or missing ETag matches only `*` |
+| If-Unmodified-Since | 412 when Last-Modified is newer, or missing |
+
+A 304 carries a new Date and the stored ETag, Content-Location, Expires,
+Cache-Control and Vary (duplicates joined), and no length. A 412 has a JSON
+body. A Range is then honoured only on a stored 200, and only when
+`If-Range` is valid: a strong ETag match, or exactly the Last-Modified date
+(`validate_ifrange_header_if_any`); otherwise the whole body is sent. As
+elsewhere, only the first field of each name counts, and dates parse as
+ATS's `mime_parse_date` does. An object whose fragments are not all there
+gets 404 (`incomplete`) whatever the conditions.
+
 The fragment chain is followed and checked before the header is sent, so an
 incomplete object is answered with 404 rather than a short body. The body is
 then pulled fragment by fragment into the connection's buffer
@@ -134,7 +155,9 @@ takes it; an HTTP/2 transport would pull as far as a stream's flow-control
 window allows, without changing the service.
 
 Verified by `tools/fixture/check.sh` (check 10): every alternate's body and
-status, HEAD lengths, ranges with and without If-Range, 416, ignored multiple
+status, HEAD lengths, ranges with and without If-Range, conditional and
+range requests as live ATS answered them (`conditional.tsv`: 304, 412, 206,
+416 and their interplay), 416, ignored multiple
 ranges, `object` and `lookup` JSON equal to the tools', selection by the
 request's own fields as live ATS served it (`select.tsv`), `/v1/stripes`
 and `/v1/dir` against `cyc-doc stripe` and `cyc-doc dir --entries --docs`

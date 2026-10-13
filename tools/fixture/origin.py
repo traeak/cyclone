@@ -14,6 +14,9 @@ checked against body_for().
                language asked for
   /query?...   same path, the query makes the key differ
 
+/small/ and /large/ responses carry an ETag: the first 16 hex digits of
+the body's SHA-256, quoted.
+
 usage: origin.py PORT
 """
 
@@ -65,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "public, max-age=86400")
         self.send_header("Last-Modified", "Mon, 05 Oct 2026 12:00:00 GMT")
+        if self.path.startswith(("/small/", "/large/")):
+            self.send_header("ETag", '"%s"' % hashlib.sha256(body).hexdigest()[:16])
         if vary:
             self.send_header("Vary", "Accept-Encoding")
             self.send_header("X-Encoding", selector or "none")

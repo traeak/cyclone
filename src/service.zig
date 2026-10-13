@@ -22,6 +22,7 @@ const select = @import("select.zig");
 const dir = @import("dir.zig");
 const Stripe = @import("stripe.zig").Stripe;
 const hash = @import("hash.zig");
+const conditional = @import("conditional.zig");
 
 pub const Op = enum {
     /// The cache key of a cache-key URL.
@@ -229,37 +230,52 @@ pub const Service = struct {
 
         const res = try arena.create(report.ObjectResult);
         res.* = try report.readObject(arena, svc.cache, key, req.target, svc.query(req, range));
-        const r = &res.report;
         switch (res.outcome) {
-            .read => {},
-            .miss => return jsonErrorCache(arena, 404, "miss", r),
-            .no_match => return jsonErrorCache(arena, 404, "no-match", r),
-            .no_such_alternate => return jsonErrorCache(arena, 404, "no-such-alternate", r),
-            .bad_head, .bad_chain => return jsonErrorCache(arena, 500, "error", r),
-            .unsatisfiable => {
-                // The range applies only to a stored 200 that If-Range lets
-                // through; otherwise this is the whole body.
-                if (!rangeApplies(&res.head.?, r, req.fields)) return svc.wholeBody(arena, req, key, res);
-                const size = report.objectSize(&res.head.?, r.selected orelse 0);
-                const fields = try arena.alloc(Field, 3);
-                fields[0] = .{ .name = "Content-Range", .value = try std.fmt.allocPrint(arena, "bytes */{d}", .{size}) };
-                fields[1] = json_type[0];
-                fields[2] = .{ .name = "X-Cyclone-Cache", .value = "hit" };
-                return .{ .status = 416, .fields = fields, .body = .{ .bytes = try stringify(arena, .{ .@"error" = r.error_message.? }) } };
-            },
+            .read, .unsatisfiable => {},
+            .miss => return jsonErrorCache(arena, 404, "miss", &res.report),
+            .no_match => return jsonErrorCache(arena, 404, "no-match", &res.report),
+            .no_such_alternate => return jsonErrorCache(arena, 404, "no-such-alternate", &res.report),
+            .bad_head, .bad_chain => return jsonErrorCache(arena, 500, "error", &res.report),
         }
-        if (range != null and !rangeApplies(&res.head.?, r, req.fields)) return svc.wholeBody(arena, req, key, res);
-        return bodyResponse(arena, svc.cache, res, range != null);
+
+        // As ATS answers from the cache (`build_response_from_cache`): the
+        // conditionals first, then a range, only on a stored 200 that
+        // If-Range lets through.
+        const stored = storedResponse(&res.head.?, res.report.selected);
+        const code = conditional.evaluate(req.fields, stored.fields, stored.status, stored.received);
+        const ranged = range != null and code == 200 and conditional.ifRangeValid(req.fields, stored.fields);
+        if (range != null and !ranged) {
+            try svc.reread(arena, req, key, res);
+            if (res.outcome != .read) return jsonErrorCache(arena, 500, "error", &res.report);
+        }
+        if (res.outcome == .unsatisfiable) {
+            const size = report.objectSize(&res.head.?, res.report.selected orelse 0);
+            const fields = try arena.alloc(Field, 3);
+            fields[0] = .{ .name = "Content-Range", .value = try std.fmt.allocPrint(arena, "bytes */{d}", .{size}) };
+            fields[1] = json_type[0];
+            fields[2] = .{ .name = "X-Cyclone-Cache", .value = "hit" };
+            return .{ .status = 416, .fields = fields, .body = .{ .bytes = try stringify(arena, .{ .@"error" = res.report.error_message.? }) } };
+        }
+        // What ATS could not read, it would not answer from the cache.
+        if (!res.chain.?.complete) return jsonErrorCache(arena, 404, "incomplete", &res.report);
+        switch (code) {
+            304 => return notModified(arena, svc.cache.io, res, stored.fields),
+            412 => {
+                const fields = try arena.alloc(Field, 2);
+                fields[0] = json_type[0];
+                fields[1] = .{ .name = "X-Cyclone-Cache", .value = "hit" };
+                return .{ .status = 412, .fields = fields, .body = .{ .bytes = try stringify(arena, .{ .@"error" = "a precondition (If-Match or If-Unmodified-Since) failed against the cached response" }) } };
+            },
+            else => return bodyResponse(arena, svc.cache, res, ranged),
+        }
     }
 
     /// Reads the alternate already chosen again, without the range.
-    fn wholeBody(svc: *Service, arena: std.mem.Allocator, req: Request, key: *const CacheKey, res: *report.ObjectResult) !Response {
+    fn reread(svc: *Service, arena: std.mem.Allocator, req: Request, key: *const CacheKey, res: *report.ObjectResult) !void {
         var q = svc.query(req, null);
         q.alt = res.report.selected orelse 0;
         q.select = false;
         res.* = try report.readObject(arena, svc.cache, key, req.target, q);
-        if (res.outcome != .read) return jsonErrorCache(arena, 500, "error", &res.report);
-        return bodyResponse(arena, svc.cache, res, false);
     }
 };
 
@@ -364,18 +380,41 @@ fn noSuchStripe(arena: std.mem.Allocator, which: [2]usize) !Response {
     return jsonError(arena, 404, "no stripe {d}:{d} (see /v1/stripes)", .{ which[0], which[1] });
 }
 
-/// Whether a Range may be applied: the stored response is a 200, and any
-/// If-Range matches its strong ETag or its Last-Modified exactly.
-fn rangeApplies(head: *const object.Head, r: *const report.ObjectReport, fields: []const Field) bool {
-    if (head.alternates.len == 0) return true;
-    const resp = head.alternates[r.selected orelse return false].response orelse return false;
-    if (resp.status != 200) return false;
-    const if_range = first(fields, "If-Range") orelse return true;
-    if (resp.get("ETag")) |etag| {
-        if (!std.mem.startsWith(u8, etag, "W/") and std.mem.eql(u8, etag, if_range)) return true;
+const Stored = struct {
+    fields: []const Field,
+    status: u16,
+    /// When ATS received the response (seconds).
+    received: i64,
+};
+
+/// The stored response of alternate `alt` (a non-HTTP object: none, 200).
+fn storedResponse(head: *const object.Head, alt: ?usize) Stored {
+    const i = alt orelse return .{ .fields = &.{}, .status = 200, .received = 0 };
+    const a = head.alternates[i];
+    const resp = a.response orelse return .{ .fields = &.{}, .status = 200, .received = a.response_received_time };
+    return .{ .fields = resp.fields, .status = @intCast(@max(0, resp.status)), .received = a.response_received_time };
+}
+
+/// A 304 as ATS builds it: a new Date, and the stored ETag,
+/// Content-Location, Expires, Cache-Control and Vary (duplicates joined).
+fn notModified(arena: std.mem.Allocator, io: Io, res: *report.ObjectResult, stored: []const Field) !Response {
+    var fields: std.ArrayList(Field) = .empty;
+    const date = try arena.create([29]u8);
+    try fields.append(arena, .{ .name = "Date", .value = conditional.formatDate(date, Io.Clock.real.now(io).toSeconds()) });
+    for (conditional.not_modified_fields) |name| {
+        var value: std.ArrayList(u8) = .empty;
+        var found = false;
+        for (stored) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) {
+            if (found) try value.appendSlice(arena, ", ");
+            try value.appendSlice(arena, f.value);
+            found = true;
+        };
+        if (found) try fields.append(arena, .{ .name = name, .value = value.items });
     }
-    if (resp.get("Last-Modified")) |lm| return std.mem.eql(u8, lm, if_range);
-    return false;
+    try fields.append(arena, .{ .name = "X-Cyclone-Cache", .value = "hit" });
+    try fields.append(arena, .{ .name = "X-Cyclone-Key", .value = res.report.key });
+    if (res.report.selected) |i| try fields.append(arena, .{ .name = "X-Cyclone-Alternate", .value = try std.fmt.allocPrint(arena, "{d}", .{i}) });
+    return .{ .status = 304, .reason = "Not Modified", .fields = fields.items };
 }
 
 /// Hop-by-hop fields and those the transport sets: not copied from the

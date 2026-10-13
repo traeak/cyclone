@@ -12,6 +12,9 @@
 //   s NAME<TAB>VALUE      a field of the stored response
 //   end
 //   date TEXT             a Date value to parse
+//   cond N                a conditional request: c and s lines as above,
+//   recv SECONDS STATUS   the response's received time and status
+//   end
 //
 // Output: every input line, and after each `end`
 //   = Q VAR ACCEPT CHARSET ENCODING LANGUAGE GZIP BR ZSTD
@@ -20,6 +23,8 @@
 // on the first fields (ACCEPT is "-" without both Accept and Content-Type),
 // and GZIP..ZSTD match_content_encoding on the client's Accept-Encoding.
 // After each `date`:  = SECONDS (mime_parse_date).
+// After a `cond` block's `end`:  =c STATUS IFRANGE
+// (match_response_to_request_conditionals, validate_ifrange_header_if_any).
 #include "api/HttpAPIHooks.h"
 #include "iocore/cache/HttpConfigAccessor.h"
 #include "iocore/cache/HttpTransactCache.h"
@@ -128,11 +133,14 @@ main()
   Config      cfg;
   HTTPHdr     client, req, resp;
   std::string line;
+  bool        cond     = false;
+  long long   received = 0;
   while (std::getline(std::cin, line)) {
     puts(line.c_str());
     std::string_view l = line;
-    if (l.starts_with("case ")) {
-      cfg = Config{};
+    if (l.starts_with("case ") || l.starts_with("cond ")) {
+      cond = l.starts_with("cond ");
+      cfg  = Config{};
       client.create(HTTPType::REQUEST);
       req.create(HTTPType::REQUEST);
       resp.create(HTTPType::RESPONSE);
@@ -143,12 +151,23 @@ main()
       int a, c, e, g, u;
       sscanf(line.c_str() + 4, "%d %d %d %d %d", &a, &c, &e, &g, &u);
       cfg.ign[0] = a, cfg.ign[1] = c, cfg.ign[2] = e, cfg.ign[3] = g, cfg.ua = u != 0;
+    } else if (l.starts_with("recv ")) {
+      int status;
+      sscanf(line.c_str() + 5, "%lld %d", &received, &status);
+      resp.status_set(static_cast<HTTPStatus>(status));
     } else if (l.starts_with("c ")) {
       add(client, l.substr(2));
     } else if (l.starts_with("r ")) {
       add(req, l.substr(2));
     } else if (l.starts_with("s ")) {
       add(resp, l.substr(2));
+    } else if (l == "end" && cond) {
+      printf("=c %d %d\n",
+             static_cast<int>(HttpTransactCache::match_response_to_request_conditionals(&client, &resp, received)),
+             HttpTransactCache::validate_ifrange_header_if_any(&client, &resp) ? 1 : 0);
+      client.destroy();
+      req.destroy();
+      resp.destroy();
     } else if (l == "end") {
       printf("=");
       q(HttpTransactCache::calculate_quality_of_match(&cfg, &client, &req, &resp));

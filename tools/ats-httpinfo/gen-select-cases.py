@@ -147,6 +147,40 @@ FIXED = [
 ]
 
 
+ETAGS = ['"v1"', 'W/"v1"', '"v2"', '""', 'v1', '"v1', '"a,b"', "*"]
+DATES_COND = ["Mon, 05 Oct 2026 12:00:00 GMT", "Sun, 04 Oct 2026 12:00:00 GMT", "Tue, 06 Oct 2026 12:00:00 GMT",
+              "Mon, 05 Oct 2026 12:00:01 GMT", "garbage", "", "Monday, 05-Oct-26 12:00:00 GMT"]
+RECEIVED = [1791201600, 1791200000, 1791300000]
+
+
+def tag_list():
+    items = [rng.choice(ETAGS) for _ in range(rng.randint(1, 3))]
+    return rng.choice([", ", ","]).join(items)
+
+
+def cond_case(n):
+    lines = ["cond %d" % n, "recv %d %d" % (rng.choice(RECEIVED), rng.choice([200, 200, 200, 404, 203]))]
+    resp = []
+    if rng.random() < 0.7:
+        resp.append(("ETag", rng.choice(ETAGS)))
+    if rng.random() < 0.6:
+        resp.append(("Last-Modified", rng.choice(DATES_COND)))
+    if rng.random() < 0.5:
+        resp.append(("Date", rng.choice(DATES_COND)))
+    req = []
+    for name, gen in (("If-None-Match", tag_list), ("If-Modified-Since", lambda: rng.choice(DATES_COND)),
+                      ("If-Match", tag_list), ("If-Unmodified-Since", lambda: rng.choice(DATES_COND)),
+                      ("If-Range", lambda: rng.choice(ETAGS + DATES_COND))):
+        if rng.random() < 0.35:
+            req.append((name, gen()))
+    for k, v in req:
+        lines.append("c %s\t%s" % (k, esc(v)))
+    for k, v in resp:
+        lines.append("s %s\t%s" % (k, esc(v)))
+    lines.append("end")
+    return lines
+
+
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 800
     for i, fields in enumerate(FIXED, 1):
@@ -158,6 +192,8 @@ def main():
         print("\n".join(case(i)))
     for d in DATES:
         print("date " + esc(d))
+    for i in range(1, n // 2 + 1):
+        print("\n".join(cond_case(i)))
 
 
 if __name__ == "__main__":

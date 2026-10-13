@@ -459,14 +459,14 @@ pub fn normalizeAcceptEncoding(gpa: std.mem.Allocator, request: []const Field, l
 // ---------------------------------------------------------------------------
 // Header parsing as ATS does it.
 
-fn find(fields: []const Field, name: []const u8) ?usize {
+pub fn find(fields: []const Field, name: []const u8) ?usize {
     for (fields, 0..) |f, i| if (std.ascii.eqlIgnoreCase(f.name, name)) return i;
     return null;
 }
 
 /// The first field's value (`MIMEField::value_get` after `field_find`):
 /// duplicates are not joined.
-fn first(fields: []const Field, name: []const u8) ?[]const u8 {
+pub fn first(fields: []const Field, name: []const u8) ?[]const u8 {
     return if (find(fields, name)) |i| fields[i].value else null;
 }
 
@@ -477,11 +477,11 @@ fn isWs(c: u8) bool {
 /// `HttpCompat::parse_tok_list` with quote trimming: tokens split on `sep`
 /// outside double quotes, trimmed of white space and of a quote pair, with
 /// empty tokens kept (an empty or blank string is one empty token).
-fn tokens(s: []const u8, sep: u8) TokIter {
+pub fn tokens(s: []const u8, sep: u8) TokIter {
     return .{ .s = s, .sep = sep };
 }
 
-const TokIter = struct {
+pub const TokIter = struct {
     s: []const u8,
     sep: u8,
     at: usize = 0,
@@ -490,7 +490,7 @@ const TokIter = struct {
     count: usize = 0,
     done: bool = false,
 
-    fn next(it: *TokIter) ?[]const u8 {
+    pub fn next(it: *TokIter) ?[]const u8 {
         const s = it.s;
         while (it.at < s.len) {
             while (it.at < s.len and isWs(s[it.at])) it.at += 1;
@@ -961,9 +961,16 @@ test "matches ATS's own functions on every case in testdata/select_golden.txt" {
     var cases: usize = 0;
     var dates: usize = 0;
     var failures: usize = 0;
+    var in_cond = false;
     var lines = std.mem.splitScalar(u8, golden, '\n');
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "case ")) {
+        if (std.mem.startsWith(u8, line, "cond ")) {
+            // Conditional requests: conditional.zig's test.
+            in_cond = true;
+        } else if (in_cond and !std.mem.eql(u8, line, "end") and !std.mem.startsWith(u8, line, "case ")) {
+            continue;
+        } else if (std.mem.startsWith(u8, line, "case ")) {
+            in_cond = false;
             case_name = line;
             cfg = .{};
             for (&sides) |*s| s.clearRetainingCapacity();

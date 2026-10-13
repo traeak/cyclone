@@ -81,9 +81,17 @@ check "head entries" "$(echo "$urls" | wc -l | tr -d ' ') vectors, 0 duplicated,
 
 # 6. Alternates, if tools/ats-httpinfo/build.sh has written ATS's own decoding
 #    of every head Doc (alts_golden.txt): cyc-doc fragment must agree on every
-#    field of every alternate.
+#    field of every alternate. Field names compare without case: ATS's
+#    MIMEField::name_get() gives its own spelling for a well-known name
+#    ("Etag"), where the cache holds the name as the origin sent it ("ETag").
+fold_names() {
+  python3 -I -c '
+import re, sys
+for line in sys.stdin.read().splitlines():
+    print(re.sub(r"^([<>]) \"([^\"]*)\"", lambda m: "%s \"%s\"" % (m[1], m[2].lower()), line))'
+}
 if [ -f "$fix/alts_golden.txt" ]; then
-  want=$(cat "$fix/alts_golden.txt")
+  want=$(fold_names < "$fix/alts_golden.txt")
   got=$(grep '^doc ' "$fix/alts_golden.txt" | cut -d' ' -f2,3 | uniq | while read -r name off; do
     case $name in span0.db) i=0 ;; span1.db) i=1 ;; esac
     "$bin/cyc-doc" fragment $spans --at "$i:$off" --json
@@ -123,12 +131,15 @@ while pos < len(text.rstrip()):
         print("response %d %s %s" % (a["status"], q(a["reason"]), a["response_version"]))
         for f in a["response_fields"]:
             print("< %s %s" % (q(f["name"]), q(f["value"])))
-')
+' | fold_names)
   if [ "$want" = "$got" ]; then
     echo "ok    alternates ($(grep -c '^doc ' "$fix/alts_golden.txt") decoded as ATS does)"
   else
     echo "FAIL  alternates (diff: golden vs cyc-doc)"
-    echo "$got" | diff "$fix/alts_golden.txt" - | head -20
+    w=$(mktemp)
+    echo "$want" > "$w"
+    echo "$got" | diff "$w" - | head -20
+    rm -f "$w"
     fail=1
   fi
 else
@@ -250,7 +261,8 @@ else
 fi
 
 # 10. The service: cyclone-d on a unix socket answers as the tools do, with
-#     its directories in memory and read from disk.
+#     its directories in memory and read from disk, and conditional requests
+#     as live ATS answered them (conditional.tsv).
 #     Bodies of every alternate, selection as ATS served it (select.tsv),
 #     ranges, If-Range, HEAD, JSON reports, errors, keep-alive, and many
 #     connections at once.
@@ -261,9 +273,9 @@ tmp=$(mktemp -d)
 "$bin/cyclone-d" $spans --unix "$tmp/sock" $mode > "$tmp/log" 2>&1 &
 daemon=$!
 for _ in $(seq 50); do [ -S "$tmp/sock" ] && break; sleep 0.1; done
-got=$(python3 -I - "$bin" "$tmp/sock" "$fix/manifest.tsv" "$fix/select.tsv" $spans <<'PY'
+got=$(python3 -I - "$bin" "$tmp/sock" "$fix/manifest.tsv" "$fix/select.tsv" "$fix/conditional.tsv" $spans <<'PY'
 import concurrent.futures, hashlib, json, os, socket, subprocess, sys, urllib.parse
-bindir, sock, manifest, select_tsv, spans = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+bindir, sock, manifest, select_tsv, conditional_tsv, spans = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 tool = os.path.join(bindir, "cyc-doc")
 lookup_tool = os.path.join(bindir, "cyc-lookup")
 
@@ -378,6 +390,25 @@ for line in open(select_tsv).read().splitlines()[1:]:
     elif st != 404 or h.get("x-cyclone-cache") != "no-match":
         bad.append("%s [%s]: ATS had no match, cyclone-d %d %s" % (url, hdr, st, h.get("x-cyclone-cache")))
 
+# Conditional and range requests, as ATS answered them (conditional.tsv):
+# the same status, the same body for 200 and 206, none for 304.
+if os.path.exists(conditional_tsv):
+    for line in open(conditional_tsv).read().splitlines()[1:]:
+        url, hdrs, status, length, sha = line.split("\t")
+        fields = hdrs.split(";;")
+        if not any(f.startswith("Accept:") for f in fields):
+            fields = ["Accept: */*"] + fields
+        st, h, b = c.get("/v1/body?url=" + q(url), fields)
+        n += 1
+        if str(st) != status:
+            bad.append("%s [%s]: ATS %s, cyclone-d %d" % (url, hdrs, status, st))
+        elif st in (200, 206) and hashlib.sha256(b).hexdigest() != sha:
+            bad.append("%s [%s]: body differs from what ATS served" % (url, hdrs))
+        elif st == 304 and (b or "content-length" in h or "date" not in h):
+            bad.append("%s [%s]: 304 with a body or a length, or without Date" % (url, hdrs))
+else:
+    bad.append("no conditional.tsv: rerun make-fixture.sh")
+
 # Stripes and directory scans, against cyc-doc stripe and dir.
 want_stripes = json.loads(subprocess.run([tool, "stripe", *spans, "--json"], capture_output=True, text=True).stdout)
 want_dirs = json.loads(subprocess.run([tool, "dir", *spans, "--entries", "--docs", "--json"], capture_output=True, text=True).stdout)
@@ -451,7 +482,7 @@ PY
 kill $daemon 2>/dev/null; wait $daemon 2>/dev/null || true
 check "service, $label ($(echo "$got" | cut -f2) requests over one socket, 32 at once)" "0 problems" "$(echo "$got" | cut -f1)"
 # Anything the daemon said besides starting up is worth seeing.
-grep -v -e 'listening on' -e 'directories in memory' "$tmp/log" | sed 's/^/  /' >&2 || true
+grep -v -e 'listening on' -e 'directories in memory' -e 'SIGTERM: stopping' -e ': stopped$' "$tmp/log" | sed 's/^/  /' >&2 || true
 rm -rf "$tmp"
 done
 

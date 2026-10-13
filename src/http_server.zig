@@ -258,7 +258,10 @@ fn send(arena: std.mem.Allocator, request: *std.http.Server.Request, resp: servi
         .extra_headers = headers,
     };
     switch (resp.body) {
-        .empty => try request.respond("", respond_options),
+        .empty => if (resp.status == 304 or resp.status == 204)
+            try respondWithoutBody(request, resp.status, resp.reason, headers, keep_alive)
+        else
+            try request.respond("", respond_options),
         .bytes => |b| try request.respond(b, respond_options),
         .stream => |body| {
             // An unknown length goes chunked.
@@ -285,6 +288,28 @@ fn send(arena: std.mem.Allocator, request: *std.http.Server.Request, resp: servi
             try bw.end();
         },
     }
+}
+
+/// A 304 or 204: no Content-Length at all. `respond` would send
+/// `content-length: 0`, which for a 304 would claim the representation is
+/// empty. Only GET and HEAD get here, so there is no request body to skip.
+fn respondWithoutBody(request: *std.http.Server.Request, status: u16, reason: ?[]const u8, headers: []const std.http.Header, keep_alive: bool) !void {
+    std.debug.assert(!request.head.method.requestHasBody());
+    const ka = keep_alive and request.head.keep_alive;
+    if (ka) request.server.reader.state = .ready;
+    const out = request.server.out;
+    const st: std.http.Status = @fromBackingInt(@intCast(status));
+    try out.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason orelse st.phrase() orelse "" });
+    switch (request.head.version) {
+        .@"HTTP/1.0" => if (ka) try out.writeAll("connection: keep-alive\r\n"),
+        .@"HTTP/1.1" => if (!ka) try out.writeAll("connection: close\r\n"),
+    }
+    for (headers) |h| {
+        var vecs: [4][]const u8 = .{ h.name, ": ", h.value, "\r\n" };
+        try out.writeVecAll(&vecs);
+    }
+    try out.writeAll("\r\n");
+    try out.flush();
 }
 
 test "percent decoding" {

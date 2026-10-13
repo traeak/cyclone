@@ -18,6 +18,7 @@ pub const select = @import("select.zig");
 pub const report = @import("report.zig");
 pub const service = @import("service.zig");
 pub const http_server = @import("http_server.zig");
+pub const conditional = @import("conditional.zig");
 pub const format = struct {
     pub const span = @import("format/span.zig");
     pub const stripe = @import("format/stripe.zig");
