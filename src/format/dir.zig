@@ -84,6 +84,24 @@ pub const Dir = struct {
     pub fn prev(d: Dir) u16 {
         return d.w[2];
     }
+
+    pub fn encode(d: Dir, b: *[entry_len]u8) void {
+        for (d.w, 0..) |w, i| std.mem.writeInt(u16, b[i * 2 ..][0..2], w, .little);
+    }
+
+    /// `dir_set_next`.
+    pub fn setNext(d: *Dir, i: u16) void {
+        d.w[3] = i;
+    }
+
+    /// `dir_set_prev`: overwrites the tag, phase and flags, as on a free
+    /// entry.
+    pub fn setPrev(d: *Dir, i: u16) void {
+        d.w[2] = i;
+    }
+
+    /// `dir_clear`.
+    pub const empty: Dir = .{ .w = @splat(0) };
 };
 
 /// Where a key lives in a directory (`Directory::probe`).
@@ -118,6 +136,10 @@ test "decode entry bits" {
     try std.testing.expect(!d.pinned());
     try std.testing.expectEqual(77, d.next());
     try std.testing.expect(!d.isEmpty());
+
+    var again: [entry_len]u8 = undefined;
+    d.encode(&again);
+    try std.testing.expectEqualSlices(u8, &b, &again);
 }
 
 test "slot from key slices" {

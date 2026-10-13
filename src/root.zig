@@ -1,4 +1,5 @@
-//! cyclone: read-only access to the Apache Traffic Server disk cache.
+//! cyclone: access to the Apache Traffic Server disk cache. Everything reads,
+//! except `dir_edit` and `delete`, which change stripe directories.
 //!
 //! Targets the cache format of ATS master (cache DB version 24.3). See PLAN.md
 //! and docs/format.md for the on-disk layout.
@@ -19,6 +20,9 @@ pub const report = @import("report.zig");
 pub const service = @import("service.zig");
 pub const http_server = @import("http_server.zig");
 pub const conditional = @import("conditional.zig");
+pub const dir_edit = @import("dir_edit.zig");
+pub const delete = @import("delete.zig");
+pub const guard = @import("guard.zig");
 pub const format = struct {
     pub const span = @import("format/span.zig");
     pub const stripe = @import("format/stripe.zig");

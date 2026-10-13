@@ -5,6 +5,7 @@ const tools = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
     .{ .name = "cyc-key", .src = "src/bin/cyc_key.zig", .desc = "Make an ATS cache key from a cache-key URL" },
     .{ .name = "cyc-doc", .src = "src/bin/cyc_doc.zig", .desc = "Read a whole cached object" },
     .{ .name = "cyc-lookup", .src = "src/bin/cyc_lookup.zig", .desc = "Locate a cache key in the cache volumes" },
+    .{ .name = "cyc-delete", .src = "src/bin/cyc_delete.zig", .desc = "Remove objects from the cache" },
     .{ .name = "cyclone-d", .src = "src/bin/cyclone_d.zig", .desc = "Serve lookups and objects over HTTP/1.1" },
 };
 

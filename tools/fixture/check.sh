@@ -585,4 +585,12 @@ default=$(backlog_refused "" 200)
 [ "$few" -gt 0 ] && few=some
 check "--backlog (some of 30 refused with 4, none of 200 by default)" "some, 0" "$few, $default"
 
+# 13. cyc-delete on a copy of the fixture (check-delete.sh): deleted objects
+#     miss, the rest hit, only directory copies change. With ATS_PREFIX set
+#     (an installed ATS master), ATS itself then runs on the copy.
+out=$("$(dirname "$0")/check-delete.sh" "$fix" ${ATS_PREFIX:-} 2>&1) || true
+ats=$(echo "$out" | sed -n 's/^ATS: //p')
+echo "$out" | grep -v -e '^ATS: ' -e 'problems$' -e '^skip ' | sed 's/^/  /' >&2 || true
+check "cyc-delete (${ats:-ATS not run; set ATS_PREFIX})" "0 problems" "$(echo "$out" | tail -1)"
+
 exit $fail

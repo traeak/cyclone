@@ -234,6 +234,54 @@ Verified against the fixture: every distinct cache key has a head entry at
 the bucket and tag its key predicts. In each stripe, the approximate
 entry sizes add up exactly to how far `write_pos` advanced.
 
+### Removing an entry (`Directory::remove`, `delete_entry`)
+
+`cyc-delete` changes the directory as ATS's own remove does
+(`CacheVC::removeEvent`): probe the key's bucket, and remove the valid entry
+whose Doc has the key as its `first_key`. `Directory::remove` takes the
+first entry in the chain with the key's tag at that offset, and
+`delete_entry` unlinks it:
+
+- **Not the head:** the predecessor's `next` skips it, the entry is cleared
+  and pushed on the front of the segment's free list (its `next` is the old
+  list head, whose `prev` now points back at it), and
+  `freelist[segment]` is the entry.
+- **The head, with a successor:** a bucket's head cannot move, so the
+  successor is copied into the head (`next` included) and the successor is
+  deleted as above.
+- **The head, alone:** it is cleared. Bucket heads never go on the free
+  list.
+
+Every deletion sets the header's `dirty`. Only the head entry goes: the
+object's other fragments keep their entries, unreachable without the head,
+until the cyclone buffer overwrites them. The Docs themselves are not
+touched.
+
+### Writing a directory back (`StripeSM::shutdown`)
+
+On shutdown ATS bumps `sync_serial` in the header, copies it to the footer,
+and writes the whole copy at A when the new serial is even, B when it is
+odd: the other copy from the one in use, which stays valid until the new
+one is whole (`chooseCopy` above). The periodic sync (`CacheSync`) writes
+the same way, header first and footer last. `cyc-delete` writes header and
+entries, syncs, then writes the footer, and refuses when the copy in use is
+the one the next serial would land on.
+
+At the next start ATS reads the copy with the higher serial and runs its
+usual recovery from `last_write_pos`, which is unchanged: it logs
+`recovery clearing offsets` for the area just past `write_pos`, as on every
+restart, and drops nothing else. With
+`proxy.config.cache.shm.enabled`, ATS instead attaches its directories from
+shared memory (`/dev/shm/<prefix>-*`) and never reads the disk copy, so an
+offline change is lost unless those segments are removed first.
+
+Verified by `tools/fixture/check-delete.sh`: deleting four objects (one
+with three alternates, one of several fragments) on a copy of the fixture
+changes bytes only in the two directory copies written, and ATS master
+started on the copy misses exactly those objects (504 for
+`only-if-cached`), serves the other 51 recorded responses unchanged, clears
+nothing, and still misses them after its own shutdown sync.
+
 ## Key → stripe
 
 A key is stored in exactly one stripe, chosen through a 32707-slot table
